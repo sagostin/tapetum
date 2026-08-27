@@ -1,0 +1,191 @@
+package api
+
+import (
+	"log/slog"
+	"net/http"
+	"time"
+
+	"github.com/go-chi/chi/v5"
+	"github.com/go-chi/chi/v5/middleware"
+	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/sagostin/tapetum/internal/auth"
+	"github.com/sagostin/tapetum/internal/camera"
+	"github.com/sagostin/tapetum/internal/config"
+	"github.com/sagostin/tapetum/internal/export"
+	"github.com/sagostin/tapetum/internal/ingest"
+	"github.com/sagostin/tapetum/internal/record"
+	"github.com/sagostin/tapetum/internal/storage"
+	"github.com/sagostin/tapetum/internal/ws"
+)
+
+// Server holds the API's dependencies.
+type Server struct {
+	cfg          *config.Config
+	pool         *pgxpool.Pool
+	auth         *auth.Manager
+	limiter      *auth.LoginLimiter
+	hub          *ws.Hub
+	cams         *camera.Store
+	segs         *record.Store
+	backend      storage.Backend
+	ingest       *ingest.Supervisor
+	exporter     *export.Worker
+	probeLimiter *probeLimiter
+	version      string
+	started      time.Time
+}
+
+func NewServer(cfg *config.Config, pool *pgxpool.Pool, hub *ws.Hub, version string,
+	cams *camera.Store, segs *record.Store, backend storage.Backend,
+	ing *ingest.Supervisor, exp *export.Worker,
+) *Server {
+	return &Server{
+		cfg:          cfg,
+		pool:         pool,
+		auth:         auth.NewManager(pool, cfg.Server.Dev),
+		limiter:      auth.NewLoginLimiter(),
+		hub:          hub,
+		cams:         cams,
+		segs:         segs,
+		backend:      backend,
+		ingest:       ing,
+		exporter:     exp,
+		probeLimiter: &probeLimiter{hits: map[string][]time.Time{}},
+		version:      version,
+		started:      time.Now(),
+	}
+}
+
+// Router assembles all routes and middleware.
+func (s *Server) Router() http.Handler {
+	r := chi.NewRouter()
+	r.Use(middleware.RequestID)
+	r.Use(middleware.RealIP)
+	r.Use(middleware.Recoverer)
+	r.Use(s.logRequests)
+	r.Use(securityHeaders)
+	r.Use(s.auth.Middleware)
+
+	r.Route("/api/v1", func(r chi.Router) {
+		r.Use(s.auth.CSRF)
+
+		// Setup & health (unauthenticated).
+		r.Get("/setup/status", s.setupStatus)
+		r.With(s.requireSetupPending).Post("/setup", s.setup)
+		r.Get("/system/health", s.health)
+
+		// Auth.
+		r.Post("/auth/login", s.login)
+		r.With(s.requireAuth).Post("/auth/logout", s.logout)
+		r.With(s.requireAuth).Get("/auth/me", s.me)
+		r.With(s.requireAuth).Post("/auth/password", s.changePassword)
+		r.With(s.requireAuth).Get("/auth/tokens", s.listTokens)
+		r.With(s.requireAuth).Post("/auth/tokens", s.createToken)
+		r.With(s.requireAuth).Delete("/auth/tokens/{id}", s.deleteToken)
+
+		// Users & roles (admin).
+		r.With(s.require(auth.PermUsersWrite)).Get("/users", s.listUsers)
+		r.With(s.require(auth.PermUsersWrite)).Post("/users", s.createUser)
+		r.With(s.require(auth.PermUsersWrite)).Get("/users/{id}", s.getUser)
+		r.With(s.require(auth.PermUsersWrite)).Patch("/users/{id}", s.updateUser)
+		r.With(s.require(auth.PermUsersWrite)).Delete("/users/{id}", s.deleteUser)
+		r.With(s.require(auth.PermUsersWrite)).Get("/roles", s.roles)
+		r.With(s.require(auth.PermUsersWrite)).Get("/audit-log", s.auditLog)
+
+		// System.
+		r.With(s.requireAuth).Get("/system/info", s.info)
+
+		// Cameras.
+		r.With(s.require(auth.PermLive)).Get("/cameras", s.listCameras)
+		r.With(s.require(auth.PermCamerasWrite)).Post("/cameras", s.createCamera)
+		r.With(s.require(auth.PermCamerasWrite)).Post("/cameras/probe", s.probeCamera)
+		r.With(s.require(auth.PermLive)).Get("/cameras/{id}", s.getCamera)
+		r.With(s.require(auth.PermCamerasWrite)).Patch("/cameras/{id}", s.updateCamera)
+		r.With(s.require(auth.PermCamerasWrite)).Delete("/cameras/{id}", s.deleteCamera)
+		r.With(s.require(auth.PermCamerasWrite)).Post("/cameras/{id}/enable", s.setCameraEnabled(true))
+		r.With(s.require(auth.PermCamerasWrite)).Post("/cameras/{id}/disable", s.setCameraEnabled(false))
+		r.With(s.require(auth.PermLive)).Get("/cameras/{id}/snapshot", s.cameraSnapshot)
+		r.With(s.require(auth.PermLive)).Get("/cameras/{id}/stats", s.cameraStats)
+
+		// Live streaming.
+		r.With(s.require(auth.PermLive)).Get("/streams/{cameraId}/mjpeg", s.mjpeg)
+		r.With(s.require(auth.PermLive)).Get("/streams/{cameraId}/live.m3u8", s.livePlaylist)
+
+		// Recordings & playback.
+		r.With(s.require(auth.PermPlayback)).Get("/recordings/timeline", s.timeline)
+		r.With(s.require(auth.PermPlayback)).Get("/recordings/availability", s.availability)
+		r.With(s.require(auth.PermPlayback)).Get("/playback/{cameraId}/playlist.m3u8", s.playbackPlaylist)
+		r.With(s.require(auth.PermPlayback)).Get("/playback/{cameraId}/init.mp4", s.initMP4)
+		r.With(s.require(auth.PermPlayback)).Get("/segments/{id}", s.serveSegment)
+		r.With(s.require(auth.PermPlayback)).Post("/segments/protect", s.protectSegments)
+		r.With(s.require(auth.PermPlayback)).Delete("/segments/protect/{id}", s.unprotectSegment)
+
+		// Exports.
+		r.With(s.require(auth.PermExport)).Post("/exports", s.createExport)
+		r.With(s.require(auth.PermExport)).Get("/exports", s.listExports)
+		r.With(s.require(auth.PermExport)).Get("/exports/{id}/download", s.downloadExport)
+	})
+
+	// WebSocket.
+	r.With(s.requireAuth).Get("/ws", s.hub.ServeHTTP)
+
+	// SPA fallback for everything else.
+	r.NotFound(s.spaHandler())
+
+	return r
+}
+
+// --- middleware ------------------------------------------------------------
+
+func (s *Server) requireAuth(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if auth.UserFrom(r.Context()) == nil {
+			Error(w, http.StatusUnauthorized, "unauthorized", "authentication required")
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func (s *Server) require(perm auth.Permission) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			u := auth.UserFrom(r.Context())
+			if u == nil {
+				Error(w, http.StatusUnauthorized, "unauthorized", "authentication required")
+				return
+			}
+			if !u.Role.Has(perm) {
+				Error(w, http.StatusForbidden, "forbidden", "insufficient permissions")
+				return
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
+func (s *Server) logRequests(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+		ww := middleware.NewWrapResponseWriter(w, r.ProtoMajor)
+		next.ServeHTTP(ww, r)
+		if r.URL.Path == "/api/v1/system/health" {
+			return // health checks are noise
+		}
+		slog.Debug("http", "method", r.Method, "path", r.URL.Path,
+			"status", ww.Status(), "dur", time.Since(start).Round(time.Microsecond))
+	})
+}
+
+func securityHeaders(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		h := w.Header()
+		h.Set("X-Frame-Options", "DENY")
+		h.Set("X-Content-Type-Options", "nosniff")
+		h.Set("Referrer-Policy", "no-referrer")
+		h.Set("Content-Security-Policy",
+			"default-src 'self'; img-src 'self' blob: data:; media-src 'self' blob:; "+
+				"connect-src 'self' ws: wss:; worker-src 'self' blob:")
+		next.ServeHTTP(w, r)
+	})
+}

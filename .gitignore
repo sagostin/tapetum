@@ -1,0 +1,19 @@
+# Go
+/tapetumd
+*.test
+*.out
+
+# Data / secrets
+/data/
+config.yaml
+!.idea/
+
+# Frontend
+web/node_modules/
+web/dist/assets/
+web/dist/*.js
+web/dist/*.css
+web/dist/*.svg
+
+# OS
+.DS_Store

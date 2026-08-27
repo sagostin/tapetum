@@ -1,0 +1,17 @@
+# Tapetum configuration. All settings can also be set via TAPETUM_* env vars
+# (env wins). Copy to config.yaml or mount at /data/config.yaml in Docker.
+
+server:
+  addr: ":8080"             # TAPETUM_ADDR
+  public_url: ""            # TAPETUM_PUBLIC_URL — used in notification links
+  data_dir: "./data"        # TAPETUM_DATA_DIR — recordings, server.key, exports
+  dev: false                # TAPETUM_DEV — allows cookies over http for local dev
+
+database:
+  url: "postgres://tapetum:tapetum@localhost:5432/tapetum?sslmode=disable"  # TAPETUM_DATABASE_URL
+
+log:
+  level: "info"             # TAPETUM_LOG_LEVEL — debug|info|warn|error
+
+# Secrets at rest: TAPETUM_SECRET_KEY (64 hex chars) or auto-generated at
+# <data_dir>/server.key on first run.

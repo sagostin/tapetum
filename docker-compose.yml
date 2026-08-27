@@ -1,0 +1,47 @@
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    ports:
+      - "5432:5432" # published for local dev (`make run`); remove in production
+    environment:
+      POSTGRES_USER: tapetum
+      POSTGRES_PASSWORD: tapetum
+      POSTGRES_DB: tapetum
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U tapetum -d tapetum"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+  app:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      TAPETUM_DATABASE_URL: postgres://tapetum:tapetum@db:5432/tapetum?sslmode=disable
+      TAPETUM_ADDR: ":8080"
+      # TAPETUM_PUBLIC_URL: https://nvr.example.com
+      # TAPETUM_SECRET_KEY: <64 hex chars>
+    volumes:
+      - tapetum-data:/data
+    depends_on:
+      db:
+        condition: service_healthy
+
+  # Optional analytics tier — uncomment to enable ClickHouse (phase 4).
+  # clickhouse:
+  #   image: clickhouse/clickhouse-server:24-alpine
+  #   restart: unless-stopped
+  #   ports:
+  #     - "8123:8123"
+  #   volumes:
+  #     - chdata:/var/lib/clickhouse
+
+volumes:
+  pgdata:
+  tapetum-data:
+  # chdata:
