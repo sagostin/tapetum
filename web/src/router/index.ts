@@ -7,6 +7,9 @@ import DashboardView from '../views/DashboardView.vue'
 const CamerasView = () => import('../views/CamerasView.vue')
 const CameraDetailView = () => import('../views/CameraDetailView.vue')
 const PlaybackView = () => import('../views/PlaybackView.vue')
+const ProfileView = () => import('../views/ProfileView.vue')
+const StorageView = () => import('../views/StorageView.vue')
+const SystemView = () => import('../views/SystemView.vue')
 
 const router = createRouter({
   history: createWebHistory(),
@@ -48,6 +51,24 @@ const router = createRouter({
       name: 'playback',
       component: PlaybackView,
       meta: { requiresAuth: true, requiresPerm: 'playback' },
+    },
+    {
+      path: '/profile',
+      name: 'profile',
+      component: ProfileView,
+      meta: { requiresAuth: true },
+    },
+    {
+      path: '/admin/storage',
+      name: 'admin-storage',
+      component: StorageView,
+      meta: { requiresAuth: true, requiresPerm: 'settings:write' },
+    },
+    {
+      path: '/admin/system',
+      name: 'admin-system',
+      component: SystemView,
+      meta: { requiresAuth: true, requiresPerm: 'users:write' },
     },
   ],
 })

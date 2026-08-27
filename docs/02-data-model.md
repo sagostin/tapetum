@@ -87,6 +87,7 @@ CREATE TABLE cameras (
     onvif_endpoint  text,                      -- http://ip/onvif/device_service
     onvif_profile   text,                      -- selected media profile token
     has_ptz         boolean NOT NULL DEFAULT false,
+    imaging_config  jsonb NOT NULL DEFAULT '{}', -- cached ONVIF video source token etc.
 
     -- recording policy
     record_mode     text NOT NULL DEFAULT 'continuous'
@@ -94,6 +95,8 @@ CREATE TABLE cameras (
     retention_days  int NOT NULL DEFAULT 14,
     retention_gb    int,                       -- optional cap; oldest evicted first
     tier_after_days int,                       -- move to S3 after N days (null = never)
+    playback_transcode text NOT NULL DEFAULT 'auto'  -- H.265→H.264 fallback policy
+                    CHECK (playback_transcode IN ('auto','never','always')),
 
     -- detection config (phase 3+)
     motion_config   jsonb NOT NULL DEFAULT '{}',  -- zones, sensitivity, schedule
@@ -231,7 +234,7 @@ CREATE TABLE audit_log (
 CREATE INDEX ON audit_log (ts);
 
 CREATE TABLE settings (                        -- singleton-ish key/value for system config
-    key   text PRIMARY KEY,                    -- 'storage.s3', 'server.public_url', …
+    key   text PRIMARY KEY,                    -- 's3' (secret_key_enc AES-GCM at rest), …
     value jsonb NOT NULL
 );
 

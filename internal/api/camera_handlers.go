@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"errors"
 	"net/http"
 	"sync"
@@ -12,27 +13,34 @@ import (
 	"github.com/sagostin/tapetum/internal/auth"
 	"github.com/sagostin/tapetum/internal/camera"
 	"github.com/sagostin/tapetum/internal/ingest"
+	"github.com/sagostin/tapetum/internal/onvif"
 )
 
 // cameraBody is the create/update payload from docs/03-api.md.
 type cameraBody struct {
-	Name          *string        `json:"name"`
-	MainURL       *string        `json:"main_url"`
-	SubURL        *string        `json:"sub_url"`
-	Username      *string        `json:"username"`
-	Password      *string        `json:"password"`
-	Transport     *string        `json:"transport"`
-	RecordMode    *string        `json:"record_mode"`
-	RetentionDays *int           `json:"retention_days"`
-	RetentionGB   *int           `json:"retention_gb"`
-	GroupID       *string        `json:"group_id"`
-	MotionConfig  map[string]any `json:"motion_config"`
-	AIConfig      map[string]any `json:"ai_config"`
+	Name              *string        `json:"name"`
+	MainURL           *string        `json:"main_url"`
+	SubURL            *string        `json:"sub_url"`
+	Username          *string        `json:"username"`
+	Password          *string        `json:"password"`
+	Transport         *string        `json:"transport"`
+	OnvifEndpoint     *string        `json:"onvif_endpoint"`
+	RecordMode        *string        `json:"record_mode"`
+	RetentionDays     *int           `json:"retention_days"`
+	RetentionGB       *int           `json:"retention_gb"`
+	TierAfterDays     *int           `json:"tier_after_days"`
+	PlaybackTranscode *string        `json:"playback_transcode"`
+	GroupID           *string        `json:"group_id"`
+	MotionConfig      map[string]any `json:"motion_config"`
+	AIConfig          map[string]any `json:"ai_config"`
 }
 
 func validTransport(t string) bool { return t == "tcp" || t == "udp" || t == "auto" }
 func validRecordMode(m string) bool {
 	return m == "continuous" || m == "motion" || m == "off"
+}
+func validPlaybackTranscode(v string) bool {
+	return v == "auto" || v == "never" || v == "always"
 }
 
 func (s *Server) listCameras(w http.ResponseWriter, r *http.Request) {
@@ -79,10 +87,19 @@ func (s *Server) createCamera(w http.ResponseWriter, r *http.Request) {
 		}
 		p.RecordMode = *b.RecordMode
 	}
+	if b.PlaybackTranscode != nil {
+		if !validPlaybackTranscode(*b.PlaybackTranscode) {
+			Error(w, http.StatusBadRequest, "bad_request", "playback_transcode must be auto|never|always")
+			return
+		}
+		p.PlaybackTranscode = *b.PlaybackTranscode
+	}
 	if b.RetentionDays != nil {
 		p.RetentionDays = *b.RetentionDays
 	}
 	p.RetentionGB = b.RetentionGB
+	p.TierAfterDays = b.TierAfterDays
+	p.OnvifEndpoint = b.OnvifEndpoint
 	p.GroupID = b.GroupID
 
 	cam, err := s.cams.Create(r.Context(), p)
@@ -151,10 +168,15 @@ func (s *Server) updateCamera(w http.ResponseWriter, r *http.Request) {
 		Error(w, http.StatusBadRequest, "bad_request", "record_mode must be continuous|motion|off")
 		return
 	}
+	if b.PlaybackTranscode != nil && !validPlaybackTranscode(*b.PlaybackTranscode) {
+		Error(w, http.StatusBadRequest, "bad_request", "playback_transcode must be auto|never|always")
+		return
+	}
 	updated, err := s.cams.Update(r.Context(), cam.ID, camera.UpdateParams{
 		Name: b.Name, MainURL: b.MainURL, SubURL: b.SubURL, Username: b.Username,
-		Password: b.Password, Transport: b.Transport, RecordMode: b.RecordMode,
-		RetentionDays: b.RetentionDays, RetentionGB: b.RetentionGB,
+		Password: b.Password, Transport: b.Transport, OnvifEndpoint: b.OnvifEndpoint,
+		RecordMode: b.RecordMode, RetentionDays: b.RetentionDays, RetentionGB: b.RetentionGB,
+		TierAfterDays: b.TierAfterDays, PlaybackTranscode: b.PlaybackTranscode,
 		GroupID: b.GroupID, MotionConfig: b.MotionConfig, AIConfig: b.AIConfig,
 	})
 	if err != nil {
@@ -175,14 +197,16 @@ func (s *Server) deleteCamera(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.ingest.Remove(cam.ID)
+	s.transcode.EvictCamera(cam.ID)
 
 	if r.URL.Query().Get("delete_recordings") == "true" {
 		segs, err := s.segs.DeleteAllForCamera(r.Context(), cam.ID)
 		if err == nil {
 			for _, seg := range segs {
-				if seg.Storage == "local" {
-					_ = s.backend.Delete(r.Context(), seg.Path)
+				if b, err := s.resolve(r.Context(), seg.Storage); err == nil {
+					_ = b.Delete(r.Context(), seg.Path)
 				}
+				s.transcode.Evict(seg.ID)
 			}
 		}
 	}
@@ -253,13 +277,26 @@ func (s *Server) probeCamera(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var b struct {
-		URL       string `json:"url"`
-		Username  string `json:"username"`
-		Password  string `json:"password"`
-		Transport string `json:"transport"`
+		URL           string `json:"url"`
+		OnvifEndpoint string `json:"onvif_endpoint"`
+		Username      string `json:"username"`
+		Password      string `json:"password"`
+		Transport     string `json:"transport"`
 	}
-	if err := Decode(w, r, &b); err != nil || b.URL == "" {
-		Error(w, http.StatusBadRequest, "bad_request", "url is required")
+	if err := Decode(w, r, &b); err != nil || (b.URL == "" && b.OnvifEndpoint == "") {
+		Error(w, http.StatusBadRequest, "bad_request", "url or onvif_endpoint is required")
+		return
+	}
+	// ONVIF probe: profiles, stream URIs, PTZ/imaging capabilities
+	if b.OnvifEndpoint != "" {
+		ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+		defer cancel()
+		res, err := onvif.Probe(ctx, b.OnvifEndpoint, b.Username, b.Password)
+		if err != nil {
+			Error(w, http.StatusBadGateway, "onvif_unreachable", err.Error())
+			return
+		}
+		JSON(w, http.StatusOK, res)
 		return
 	}
 	res := ingest.Probe(r.Context(), b.URL, b.Username, b.Password, b.Transport)

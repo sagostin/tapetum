@@ -18,8 +18,12 @@ import (
 	"github.com/sagostin/tapetum/internal/db"
 	"github.com/sagostin/tapetum/internal/export"
 	"github.com/sagostin/tapetum/internal/ingest"
+	"github.com/sagostin/tapetum/internal/live"
 	"github.com/sagostin/tapetum/internal/record"
+	"github.com/sagostin/tapetum/internal/settings"
 	"github.com/sagostin/tapetum/internal/storage"
+	"github.com/sagostin/tapetum/internal/transcode"
+	"github.com/sagostin/tapetum/internal/webrtc"
 	"github.com/sagostin/tapetum/internal/ws"
 )
 
@@ -61,21 +65,38 @@ func main() {
 	slog.Info("database migrated")
 
 	hub := ws.NewHub()
+	liveHub := live.NewHub()
 
 	backend, err := storage.NewLocal(cfg.Server.DataDir)
 	if err != nil {
 		slog.Error("storage init failed", "err", err)
 		os.Exit(1)
 	}
+	st, err := settings.NewStore(pool, serverKey)
+	if err != nil {
+		slog.Error("settings store init failed", "err", err)
+		os.Exit(1)
+	}
+	s3m := storage.NewS3Manager(st)
+	resolve := storage.NewResolver(backend, s3m)
+
 	cams, err := camera.NewStore(pool, serverKey)
 	if err != nil {
 		slog.Error("camera store init failed", "err", err)
 		os.Exit(1)
 	}
 	segs := record.NewStore(pool)
-	ing := ingest.NewSupervisor(cams, segs, backend, hub)
-	exp := export.NewWorker(pool, segs, cams, backend, hub, cfg.Server.DataDir)
-	janitor := record.NewJanitor(segs, cams, backend, hub)
+	ing := ingest.NewSupervisor(cams, segs, backend, hub, liveHub)
+	exp := export.NewWorker(pool, segs, cams, backend, resolve, hub, cfg.Server.DataDir)
+	janitor := record.NewJanitor(segs, cams, backend, resolve, hub)
+	tierer := record.NewTierer(segs, cams, backend, s3m)
+	tc, err := transcode.NewService(cfg.Server.DataDir)
+	if err != nil {
+		slog.Error("transcode init failed", "err", err)
+		os.Exit(1)
+	}
+	rtc := webrtc.NewServer(liveHub)
+	defer rtc.Close()
 
 	if err := ing.Start(ctx); err != nil {
 		slog.Error("ingest start failed", "err", err)
@@ -83,8 +104,10 @@ func main() {
 	}
 	defer ing.Close()
 	go janitor.Run(ctx)
+	go tierer.Run(ctx)
 
-	srv := api.NewServer(cfg, pool, hub, version, cams, segs, backend, ing, exp)
+	srv := api.NewServer(cfg, pool, hub, version, cams, segs, backend, resolve,
+		s3m, st, ing, exp, rtc, tc)
 
 	httpSrv := &http.Server{
 		Addr:              cfg.Server.Addr,

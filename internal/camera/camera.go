@@ -27,29 +27,31 @@ const (
 // Camera is the cameras table row. PasswordEnc holds the RTSP password
 // encrypted with AES-GCM under the server key (never serialized to JSON).
 type Camera struct {
-	ID            string         `json:"id"`
-	Name          string         `json:"name"`
-	Enabled       bool           `json:"enabled"`
-	MainURL       string         `json:"main_url"`
-	SubURL        *string        `json:"sub_url"`
-	Username      string         `json:"username"`
-	PasswordEnc   []byte         `json:"-"`
-	Transport     string         `json:"transport"`
-	OnvifEndpoint *string        `json:"onvif_endpoint"`
-	OnvifProfile  *string        `json:"onvif_profile"`
-	HasPTZ        bool           `json:"has_ptz"`
-	RecordMode    string         `json:"record_mode"`
-	RetentionDays int            `json:"retention_days"`
-	RetentionGB   *int           `json:"retention_gb"`
-	TierAfterDays *int           `json:"tier_after_days"`
-	MotionConfig  map[string]any `json:"motion_config"`
-	AIConfig      map[string]any `json:"ai_config"`
-	GroupID       *string        `json:"group_id"`
-	Status        Status         `json:"status"`
-	StatusDetail  map[string]any `json:"status_detail"`
-	LastSeenAt    *time.Time     `json:"last_seen_at"`
-	CreatedAt     time.Time      `json:"created_at"`
-	UpdatedAt     time.Time      `json:"updated_at"`
+	ID                string         `json:"id"`
+	Name              string         `json:"name"`
+	Enabled           bool           `json:"enabled"`
+	MainURL           string         `json:"main_url"`
+	SubURL            *string        `json:"sub_url"`
+	Username          string         `json:"username"`
+	PasswordEnc       []byte         `json:"-"`
+	Transport         string         `json:"transport"`
+	OnvifEndpoint     *string        `json:"onvif_endpoint"`
+	OnvifProfile      *string        `json:"onvif_profile"`
+	HasPTZ            bool           `json:"has_ptz"`
+	RecordMode        string         `json:"record_mode"`
+	RetentionDays     int            `json:"retention_days"`
+	RetentionGB       *int           `json:"retention_gb"`
+	TierAfterDays     *int           `json:"tier_after_days"`
+	MotionConfig      map[string]any `json:"motion_config"`
+	AIConfig          map[string]any `json:"ai_config"`
+	GroupID           *string        `json:"group_id"`
+	PlaybackTranscode string         `json:"playback_transcode"`
+	ImagingConfig     map[string]any `json:"imaging_config"`
+	Status            Status         `json:"status"`
+	StatusDetail      map[string]any `json:"status_detail"`
+	LastSeenAt        *time.Time     `json:"last_seen_at"`
+	CreatedAt         time.Time      `json:"created_at"`
+	UpdatedAt         time.Time      `json:"updated_at"`
 }
 
 var ErrNotFound = errors.New("camera not found")
@@ -105,7 +107,8 @@ func (s *Store) DecryptPassword(enc []byte) (string, error) {
 const columns = `id, name, enabled, main_url, sub_url, username, password_enc,
 	transport, onvif_endpoint, onvif_profile, has_ptz, record_mode,
 	retention_days, retention_gb, tier_after_days, motion_config, ai_config,
-	group_id, status, status_detail, last_seen_at, created_at, updated_at`
+	group_id, playback_transcode, imaging_config, status, status_detail,
+	last_seen_at, created_at, updated_at`
 
 func (s *Store) scan(row pgx.Row) (*Camera, error) {
 	var c Camera
@@ -113,8 +116,8 @@ func (s *Store) scan(row pgx.Row) (*Camera, error) {
 		&c.Username, &c.PasswordEnc, &c.Transport, &c.OnvifEndpoint,
 		&c.OnvifProfile, &c.HasPTZ, &c.RecordMode, &c.RetentionDays,
 		&c.RetentionGB, &c.TierAfterDays, &c.MotionConfig, &c.AIConfig,
-		&c.GroupID, &c.Status, &c.StatusDetail, &c.LastSeenAt,
-		&c.CreatedAt, &c.UpdatedAt)
+		&c.GroupID, &c.PlaybackTranscode, &c.ImagingConfig, &c.Status,
+		&c.StatusDetail, &c.LastSeenAt, &c.CreatedAt, &c.UpdatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -186,16 +189,21 @@ func (s *Store) ListEnabled(ctx context.Context) ([]*Camera, error) {
 }
 
 type CreateParams struct {
-	Name          string
-	MainURL       string
-	SubURL        *string
-	Username      string
-	Password      string // plaintext; encrypted before insert
-	Transport     string
-	RecordMode    string
-	RetentionDays int
-	RetentionGB   *int
-	GroupID       *string
+	Name              string
+	MainURL           string
+	SubURL            *string
+	Username          string
+	Password          string // plaintext; encrypted before insert
+	Transport         string
+	OnvifEndpoint     *string
+	OnvifProfile      *string
+	HasPTZ            bool
+	RecordMode        string
+	RetentionDays     int
+	RetentionGB       *int
+	TierAfterDays     *int
+	PlaybackTranscode string
+	GroupID           *string
 }
 
 func (s *Store) Create(ctx context.Context, p CreateParams) (*Camera, error) {
@@ -203,29 +211,42 @@ func (s *Store) Create(ctx context.Context, p CreateParams) (*Camera, error) {
 	if err != nil {
 		return nil, err
 	}
+	transcode := p.PlaybackTranscode
+	if transcode == "" {
+		transcode = "auto"
+	}
 	return s.scan(s.pool.QueryRow(ctx, `
 		INSERT INTO cameras (name, main_url, sub_url, username, password_enc,
-		                     transport, record_mode, retention_days, retention_gb, group_id)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+		                     transport, onvif_endpoint, onvif_profile, has_ptz,
+		                     record_mode, retention_days, retention_gb,
+		                     tier_after_days, playback_transcode, group_id)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
 		RETURNING `+columns,
-		p.Name, p.MainURL, p.SubURL, p.Username, enc,
-		p.Transport, p.RecordMode, p.RetentionDays, p.RetentionGB, p.GroupID))
+		p.Name, p.MainURL, p.SubURL, p.Username, enc, p.Transport,
+		p.OnvifEndpoint, p.OnvifProfile, p.HasPTZ, p.RecordMode,
+		p.RetentionDays, p.RetentionGB, p.TierAfterDays, transcode, p.GroupID))
 }
 
 // UpdateParams carries optional field updates; nil pointer = leave unchanged.
 type UpdateParams struct {
-	Name          *string
-	MainURL       *string
-	SubURL        *string // empty string clears
-	Username      *string
-	Password      *string // empty string clears
-	Transport     *string
-	RecordMode    *string
-	RetentionDays *int
-	RetentionGB   *int // nil pointer ambiguity handled by handler via ClearRetentionGB
-	GroupID       *string
-	MotionConfig  map[string]any
-	AIConfig      map[string]any
+	Name              *string
+	MainURL           *string
+	SubURL            *string // empty string clears
+	Username          *string
+	Password          *string // empty string clears
+	Transport         *string
+	OnvifEndpoint     *string // empty string clears
+	OnvifProfile      *string
+	HasPTZ            *bool
+	RecordMode        *string
+	RetentionDays     *int
+	RetentionGB       *int // nil pointer ambiguity handled by handler via ClearRetentionGB
+	TierAfterDays     *int
+	PlaybackTranscode *string
+	GroupID           *string
+	MotionConfig      map[string]any
+	AIConfig          map[string]any
+	ImagingConfig     map[string]any
 }
 
 func (s *Store) Update(ctx context.Context, id string, p UpdateParams) (*Camera, error) {
@@ -259,6 +280,21 @@ func (s *Store) Update(ctx context.Context, id string, p UpdateParams) (*Camera,
 	if p.Transport != nil {
 		cur.Transport = *p.Transport
 	}
+	if p.OnvifEndpoint != nil {
+		if *p.OnvifEndpoint == "" {
+			cur.OnvifEndpoint = nil
+			cur.OnvifProfile = nil
+			cur.HasPTZ = false
+		} else {
+			cur.OnvifEndpoint = p.OnvifEndpoint
+		}
+	}
+	if p.OnvifProfile != nil {
+		cur.OnvifProfile = p.OnvifProfile
+	}
+	if p.HasPTZ != nil {
+		cur.HasPTZ = *p.HasPTZ
+	}
 	if p.RecordMode != nil {
 		cur.RecordMode = *p.RecordMode
 	}
@@ -267,6 +303,12 @@ func (s *Store) Update(ctx context.Context, id string, p UpdateParams) (*Camera,
 	}
 	if p.RetentionGB != nil {
 		cur.RetentionGB = p.RetentionGB
+	}
+	if p.TierAfterDays != nil {
+		cur.TierAfterDays = p.TierAfterDays
+	}
+	if p.PlaybackTranscode != nil {
+		cur.PlaybackTranscode = *p.PlaybackTranscode
 	}
 	if p.GroupID != nil {
 		cur.GroupID = p.GroupID
@@ -277,15 +319,22 @@ func (s *Store) Update(ctx context.Context, id string, p UpdateParams) (*Camera,
 	if p.AIConfig != nil {
 		cur.AIConfig = p.AIConfig
 	}
+	if p.ImagingConfig != nil {
+		cur.ImagingConfig = p.ImagingConfig
+	}
 	return s.scan(s.pool.QueryRow(ctx, `
 		UPDATE cameras SET name=$2, main_url=$3, sub_url=$4, username=$5,
 			password_enc=$6, transport=$7, record_mode=$8, retention_days=$9,
 			retention_gb=$10, group_id=$11, motion_config=$12, ai_config=$13,
+			onvif_endpoint=$14, onvif_profile=$15, has_ptz=$16,
+			tier_after_days=$17, playback_transcode=$18, imaging_config=$19,
 			updated_at=now()
 		WHERE id=$1 RETURNING `+columns,
 		id, cur.Name, cur.MainURL, cur.SubURL, cur.Username, cur.PasswordEnc,
 		cur.Transport, cur.RecordMode, cur.RetentionDays, cur.RetentionGB,
-		cur.GroupID, cur.MotionConfig, cur.AIConfig))
+		cur.GroupID, cur.MotionConfig, cur.AIConfig, cur.OnvifEndpoint,
+		cur.OnvifProfile, cur.HasPTZ, cur.TierAfterDays, cur.PlaybackTranscode,
+		cur.ImagingConfig))
 }
 
 func (s *Store) Delete(ctx context.Context, id string) error {

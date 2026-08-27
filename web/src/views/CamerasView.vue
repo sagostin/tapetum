@@ -1,10 +1,11 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import { get, post, del, ApiError } from '../api/client'
-import type { Camera, CameraListResponse } from '../api/types'
+import type { Camera, CameraListResponse, DiscoveredDevice, DiscoverResponse } from '../api/types'
 import { useAuthStore } from '../stores/auth'
 import StatusBadge from '../components/StatusBadge.vue'
 import CameraFormModal from '../components/CameraFormModal.vue'
+import type { CameraPrefill } from '../components/CameraFormModal.vue'
 
 const auth = useAuthStore()
 const canWrite = computed(() => auth.user?.permissions.includes('cameras:write') ?? false)
@@ -15,6 +16,7 @@ const loadError = ref('')
 
 const showForm = ref(false)
 const editingCamera = ref<Camera | null>(null)
+const formPrefill = ref<CameraPrefill | null>(null)
 
 const deletingCamera = ref<Camera | null>(null)
 const deleteRecordings = ref(false)
@@ -22,6 +24,12 @@ const deleting = ref(false)
 const deleteError = ref('')
 
 const actionError = ref('')
+
+// ---- ONVIF discovery ----
+const showDiscover = ref(false)
+const discovering = ref(false)
+const discoverError = ref('')
+const devices = ref<DiscoveredDevice[]>([])
 
 let pollTimer: ReturnType<typeof setInterval> | null = null
 
@@ -39,18 +47,46 @@ async function refresh() {
 
 function openAdd() {
   editingCamera.value = null
+  formPrefill.value = null
   showForm.value = true
 }
 
 function openEdit(cam: Camera) {
   editingCamera.value = cam
+  formPrefill.value = null
   showForm.value = true
 }
 
 async function onSaved() {
   showForm.value = false
   editingCamera.value = null
+  formPrefill.value = null
   await refresh()
+}
+
+async function discover() {
+  showDiscover.value = true
+  discovering.value = true
+  discoverError.value = ''
+  devices.value = []
+  try {
+    const res = await post<DiscoverResponse>('/cameras/discover', {})
+    devices.value = res.devices ?? []
+  } catch (err) {
+    discoverError.value = err instanceof ApiError ? err.message : 'Discovery failed'
+  } finally {
+    discovering.value = false
+  }
+}
+
+function adopt(dev: DiscoveredDevice) {
+  showDiscover.value = false
+  editingCamera.value = null
+  formPrefill.value = {
+    name: dev.name || dev.hardware || '',
+    onvif_endpoint: dev.endpoint,
+  }
+  showForm.value = true
 }
 
 async function toggleEnabled(cam: Camera) {
@@ -100,9 +136,12 @@ onBeforeUnmount(() => {
   <div>
     <div class="page-header">
       <h1 class="page-title">Cameras</h1>
-      <button v-if="canWrite" class="btn btn-primary btn-inline" type="button" @click="openAdd">
-        Add camera
-      </button>
+      <div v-if="canWrite" class="header-actions">
+        <button class="btn btn-ghost btn-inline" type="button" @click="discover">Discover</button>
+        <button class="btn btn-primary btn-inline" type="button" @click="openAdd">
+          Add camera
+        </button>
+      </div>
     </div>
 
     <p v-if="actionError" class="error-text">{{ actionError }}</p>
@@ -165,9 +204,35 @@ onBeforeUnmount(() => {
     <CameraFormModal
       v-if="showForm"
       :camera="editingCamera"
+      :prefill="formPrefill"
       @close="showForm = false"
       @saved="onSaved"
     />
+
+    <div v-if="showDiscover" class="modal-backdrop" @click.self="showDiscover = false">
+      <div class="modal card">
+        <h2 class="modal-title">Discovered ONVIF devices</h2>
+        <p v-if="discovering" class="muted">Scanning the network…</p>
+        <p v-else-if="discoverError" class="error-text">{{ discoverError }}</p>
+        <p v-else-if="!devices.length" class="muted">No ONVIF devices found.</p>
+        <div v-else class="device-list">
+          <div v-for="dev in devices" :key="dev.endpoint" class="device-row">
+            <div class="device-info">
+              <span class="device-name">{{ dev.name || dev.hardware || 'ONVIF device' }}</span>
+              <span v-if="dev.hardware && dev.hardware !== dev.name" class="device-sub">{{ dev.hardware }}</span>
+              <span class="device-sub mono">{{ dev.endpoint }}</span>
+            </div>
+            <button class="btn btn-ghost btn-sm" type="button" @click="adopt(dev)">Adopt</button>
+          </div>
+        </div>
+        <div class="modal-actions">
+          <button class="btn btn-ghost" type="button" @click="showDiscover = false">Close</button>
+          <button class="btn btn-ghost" type="button" :disabled="discovering" @click="discover">
+            {{ discovering ? 'Scanning…' : 'Scan again' }}
+          </button>
+        </div>
+      </div>
+    </div>
 
     <div v-if="deletingCamera" class="modal-backdrop" @click.self="deletingCamera = null">
       <div class="modal card">
@@ -205,6 +270,51 @@ onBeforeUnmount(() => {
 
 .btn-inline {
   width: auto;
+}
+
+.header-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+}
+
+.device-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  margin-top: 0.75rem;
+  max-height: 320px;
+  overflow-y: auto;
+}
+
+.device-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  padding: 0.6rem 0.75rem;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg-elevated);
+}
+
+.device-info {
+  display: flex;
+  flex-direction: column;
+  gap: 0.1rem;
+  min-width: 0;
+}
+
+.device-name {
+  font-weight: 500;
+}
+
+.device-sub {
+  font-size: 0.8rem;
+  color: var(--text-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .btn-sm {

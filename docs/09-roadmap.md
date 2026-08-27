@@ -55,18 +55,28 @@ real hardware still pending (cross-cutting requirement).
 
 **Goal:** ONVIF integration, proper live view, S3.
 
-- [ ] ONVIF: WS-Discovery scan, adopt flow, profile sync (onvif-go)
-- [ ] ONVIF: PTZ (move/stop/presets) + imaging get/set; PtzPad + Zone-less
+- [x] ONVIF: WS-Discovery scan, adopt flow, profile sync (onvif-go)
+- [x] ONVIF: PTZ (move/stop/presets) + imaging get/set; PtzPad + Zone-less
       camera settings UI
-- [ ] WebRTC live (pion): signaling route, peer management, grid upgrade
+- [x] WebRTC live (pion): signaling route, peer management, grid upgrade
       from MJPEG → WebRTC with fallback chain
-- [ ] S3 backend: put/presign/delete, per-camera tiering worker
-- [ ] Storage admin UI: usage, tiering, retention projections
-- [ ] H.265→H.264 lazy transcode fallback for unsupported browsers
-- [ ] API tokens UI; audit log UI
+- [x] S3 backend: put/presign/delete, per-camera tiering worker
+- [x] Storage admin UI: usage, tiering, retention projections
+- [x] H.265→H.264 lazy transcode fallback for unsupported browsers
+- [x] API tokens UI; audit log UI
 
 **Exit:** discover + adopt an ONVIF camera in <1 min; PTZ works; segments
 older than N days play back from S3 with no visible difference.
+
+**Verified (E2E smoke, mediamtx + ffmpeg testsrc + minio + pion test client):**
+WS-Discovery found a real LAN device → probe/sync/PTZ/imaging error paths
+clean without endpoint → WebRTC offer/answer with real pion client receiving
+H.264 RTP (111 packets) → H.265 camera transcode fallback (ffmpeg, tfdt
+patched to absolute timeline, verified at box level) → S3 config w/ bucket
+ping → tiering worker moved a 3-day-old segment to minio → `/segments` 302
+presigned GET (bytes served) → export spanning an S3 segment → janitor
+evicted the S3 segment (object + row gone). Real ONVIF camera adopt/PTZ
+needs physical hardware (soak, cross-cutting requirement).
 
 ## Phase 3 — Motion Events & Notifications
 

@@ -154,6 +154,68 @@ func (s *Store) CameraBytes(ctx context.Context, camID string) (int64, error) {
 	return n, err
 }
 
+// SegmentsToTier returns the oldest local segments of a camera eligible for
+// tiering to S3 (start before cutoff).
+func (s *Store) SegmentsToTier(ctx context.Context, camID string, cutoff time.Time, limit int) ([]*Segment, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT `+segCols+` FROM recording_segments
+		WHERE camera_id=$1 AND storage='local' AND start_ts < $2
+		ORDER BY start_ts LIMIT $3`, camID, cutoff, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []*Segment{}
+	for rows.Next() {
+		seg, err := scanSegment(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, seg)
+	}
+	return out, rows.Err()
+}
+
+// MarkTiered flips a segment row to the S3 tier.
+func (s *Store) MarkTiered(ctx context.Context, id string) error {
+	_, err := s.pool.Exec(ctx,
+		`UPDATE recording_segments SET storage='s3' WHERE id=$1`, id)
+	return err
+}
+
+// StorageStat is per-camera, per-tier usage for the storage admin view.
+type StorageStat struct {
+	CameraID     string     `json:"camera_id"`
+	Storage      string     `json:"storage"`
+	Bytes        int64      `json:"bytes"`
+	SegmentCount int        `json:"segment_count"`
+	Oldest       *time.Time `json:"oldest,omitempty"`
+	Newest       *time.Time `json:"newest,omitempty"`
+}
+
+// StorageStats returns usage grouped by camera and storage tier.
+func (s *Store) StorageStats(ctx context.Context) ([]*StorageStat, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT camera_id, storage, COALESCE(sum(size_bytes),0), count(*),
+		       min(start_ts), max(end_ts)
+		FROM recording_segments
+		GROUP BY camera_id, storage`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []*StorageStat{}
+	for rows.Next() {
+		st := &StorageStat{}
+		if err := rows.Scan(&st.CameraID, &st.Storage, &st.Bytes,
+			&st.SegmentCount, &st.Oldest, &st.Newest); err != nil {
+			return nil, err
+		}
+		out = append(out, st)
+	}
+	return out, rows.Err()
+}
+
 // CameraIDsWithSegments returns distinct camera IDs present in the index.
 func (s *Store) CameraIDsWithSegments(ctx context.Context) ([]string, error) {
 	rows, err := s.pool.Query(ctx, `SELECT DISTINCT camera_id FROM recording_segments`)

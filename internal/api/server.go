@@ -14,7 +14,10 @@ import (
 	"github.com/sagostin/tapetum/internal/export"
 	"github.com/sagostin/tapetum/internal/ingest"
 	"github.com/sagostin/tapetum/internal/record"
+	"github.com/sagostin/tapetum/internal/settings"
 	"github.com/sagostin/tapetum/internal/storage"
+	"github.com/sagostin/tapetum/internal/transcode"
+	"github.com/sagostin/tapetum/internal/webrtc"
 	"github.com/sagostin/tapetum/internal/ws"
 )
 
@@ -28,8 +31,13 @@ type Server struct {
 	cams         *camera.Store
 	segs         *record.Store
 	backend      storage.Backend
+	resolve      storage.Resolver
+	s3m          *storage.S3Manager
+	settings     *settings.Store
 	ingest       *ingest.Supervisor
 	exporter     *export.Worker
+	webrtc       *webrtc.Server
+	transcode    *transcode.Service
 	probeLimiter *probeLimiter
 	version      string
 	started      time.Time
@@ -37,7 +45,8 @@ type Server struct {
 
 func NewServer(cfg *config.Config, pool *pgxpool.Pool, hub *ws.Hub, version string,
 	cams *camera.Store, segs *record.Store, backend storage.Backend,
-	ing *ingest.Supervisor, exp *export.Worker,
+	resolve storage.Resolver, s3m *storage.S3Manager, st *settings.Store,
+	ing *ingest.Supervisor, exp *export.Worker, rtc *webrtc.Server, tc *transcode.Service,
 ) *Server {
 	return &Server{
 		cfg:          cfg,
@@ -48,8 +57,13 @@ func NewServer(cfg *config.Config, pool *pgxpool.Pool, hub *ws.Hub, version stri
 		cams:         cams,
 		segs:         segs,
 		backend:      backend,
+		resolve:      resolve,
+		s3m:          s3m,
+		settings:     st,
 		ingest:       ing,
 		exporter:     exp,
+		webrtc:       rtc,
+		transcode:    tc,
 		probeLimiter: &probeLimiter{hits: map[string][]time.Time{}},
 		version:      version,
 		started:      time.Now(),
@@ -94,20 +108,36 @@ func (s *Server) Router() http.Handler {
 
 		// System.
 		r.With(s.requireAuth).Get("/system/info", s.info)
+		r.With(s.require(auth.PermSettingsWrite)).Get("/system/settings", s.getSettings)
+		r.With(s.require(auth.PermSettingsWrite)).Put("/system/settings", s.putSettings)
+		r.With(s.require(auth.PermSettingsWrite)).Get("/system/storage", s.storageOverview)
 
 		// Cameras.
 		r.With(s.require(auth.PermLive)).Get("/cameras", s.listCameras)
 		r.With(s.require(auth.PermCamerasWrite)).Post("/cameras", s.createCamera)
 		r.With(s.require(auth.PermCamerasWrite)).Post("/cameras/probe", s.probeCamera)
+		r.With(s.require(auth.PermCamerasWrite)).Post("/cameras/discover", s.discoverCameras)
 		r.With(s.require(auth.PermLive)).Get("/cameras/{id}", s.getCamera)
 		r.With(s.require(auth.PermCamerasWrite)).Patch("/cameras/{id}", s.updateCamera)
 		r.With(s.require(auth.PermCamerasWrite)).Delete("/cameras/{id}", s.deleteCamera)
 		r.With(s.require(auth.PermCamerasWrite)).Post("/cameras/{id}/enable", s.setCameraEnabled(true))
 		r.With(s.require(auth.PermCamerasWrite)).Post("/cameras/{id}/disable", s.setCameraEnabled(false))
+		r.With(s.require(auth.PermCamerasWrite)).Post("/cameras/{id}/onvif/sync", s.onvifSync)
 		r.With(s.require(auth.PermLive)).Get("/cameras/{id}/snapshot", s.cameraSnapshot)
 		r.With(s.require(auth.PermLive)).Get("/cameras/{id}/stats", s.cameraStats)
 
+		// PTZ & imaging.
+		r.With(s.require(auth.PermPTZ)).Post("/cameras/{id}/ptz/move", s.ptzMove)
+		r.With(s.require(auth.PermPTZ)).Post("/cameras/{id}/ptz/stop", s.ptzStop)
+		r.With(s.require(auth.PermPTZ)).Get("/cameras/{id}/ptz/presets", s.ptzPresets)
+		r.With(s.require(auth.PermPTZ)).Post("/cameras/{id}/ptz/presets", s.ptzSavePreset)
+		r.With(s.require(auth.PermPTZ)).Post("/cameras/{id}/ptz/presets/{token}/goto", s.ptzGotoPreset)
+		r.With(s.require(auth.PermPTZ)).Delete("/cameras/{id}/ptz/presets/{token}", s.ptzDeletePreset)
+		r.With(s.require(auth.PermPTZ)).Get("/cameras/{id}/imaging", s.imagingGet)
+		r.With(s.require(auth.PermPTZ)).Put("/cameras/{id}/imaging", s.imagingPut)
+
 		// Live streaming.
+		r.With(s.require(auth.PermLive)).Post("/streams/{cameraId}/webrtc", s.webrtcOffer)
 		r.With(s.require(auth.PermLive)).Get("/streams/{cameraId}/mjpeg", s.mjpeg)
 		r.With(s.require(auth.PermLive)).Get("/streams/{cameraId}/live.m3u8", s.livePlaylist)
 

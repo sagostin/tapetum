@@ -45,7 +45,8 @@ type Worker struct {
 	pool    *pgxpool.Pool
 	segs    *record.Store
 	cams    *camera.Store
-	backend storage.Backend
+	backend storage.Backend // local (write path for artifacts)
+	resolve storage.Resolver
 	hub     *ws.Hub
 	dataDir string
 	log     *slog.Logger
@@ -54,10 +55,10 @@ type Worker struct {
 }
 
 func NewWorker(pool *pgxpool.Pool, segs *record.Store, cams *camera.Store,
-	backend storage.Backend, hub *ws.Hub, dataDir string,
+	backend storage.Backend, resolve storage.Resolver, hub *ws.Hub, dataDir string,
 ) *Worker {
 	return &Worker{
-		pool: pool, segs: segs, cams: cams, backend: backend, hub: hub,
+		pool: pool, segs: segs, cams: cams, backend: backend, resolve: resolve, hub: hub,
 		dataDir: dataDir,
 		log:     slog.With("component", "export"),
 		sem:     make(chan struct{}, 2),
@@ -214,12 +215,13 @@ func (w *Worker) process(id string) {
 		return
 	}
 	for _, s := range segs {
-		if s.Storage != "local" {
-			fail(errors.New("export of S3-tiered segments not supported yet"))
+		b, err := w.resolve(ctx, s.Storage)
+		if err != nil {
 			cf.Close()
+			fail(fmt.Errorf("resolve tier %s: %w", s.Storage, err))
 			return
 		}
-		rc, err := w.backend.Open(ctx, s.Path)
+		rc, err := b.Open(ctx, s.Path)
 		if err != nil {
 			cf.Close()
 			fail(fmt.Errorf("open segment %s: %w", s.ID, err))

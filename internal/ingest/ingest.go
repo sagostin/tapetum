@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/sagostin/tapetum/internal/camera"
+	"github.com/sagostin/tapetum/internal/live"
 	"github.com/sagostin/tapetum/internal/record"
 	"github.com/sagostin/tapetum/internal/storage"
 	"github.com/sagostin/tapetum/internal/ws"
@@ -26,6 +27,7 @@ type Supervisor struct {
 	segs    *record.Store
 	backend storage.Backend
 	hub     *ws.Hub
+	live    *live.Hub
 	log     *slog.Logger
 
 	mu      sync.Mutex
@@ -33,12 +35,15 @@ type Supervisor struct {
 	snaps   map[string]*snapshot // camera ID → latest keyframe JPEG source
 }
 
-func NewSupervisor(cams *camera.Store, segs *record.Store, backend storage.Backend, hub *ws.Hub) *Supervisor {
+func NewSupervisor(cams *camera.Store, segs *record.Store, backend storage.Backend,
+	hub *ws.Hub, liveHub *live.Hub,
+) *Supervisor {
 	return &Supervisor{
 		cams:    cams,
 		segs:    segs,
 		backend: backend,
 		hub:     hub,
+		live:    liveHub,
 		log:     slog.With("component", "ingest"),
 		workers: map[string]*cameraWorker{},
 		snaps:   map[string]*snapshot{},
@@ -89,7 +94,7 @@ func (s *Supervisor) Remove(camID string) {
 func (s *Supervisor) addLocked(c *camera.Camera) {
 	snap := &snapshot{}
 	s.snaps[c.ID] = snap
-	w := newCameraWorker(c, s.cams, s.segs, s.backend, s.hub, snap, s.log)
+	w := newCameraWorker(c, s.cams, s.segs, s.backend, s.hub, s.live, snap, s.log)
 	s.workers[c.ID] = w
 	go w.run()
 }

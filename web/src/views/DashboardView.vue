@@ -3,11 +3,11 @@ import { onBeforeUnmount, onMounted, ref } from 'vue'
 import { get } from '../api/client'
 import type { Camera, CameraListResponse } from '../api/types'
 import StatusBadge from '../components/StatusBadge.vue'
+import LivePlayer from '../components/LivePlayer.vue'
 
 const cameras = ref<Camera[]>([])
 const loading = ref(true)
 const loadError = ref('')
-const failedPreviews = ref<Set<string>>(new Set())
 
 let pollTimer: ReturnType<typeof setInterval> | null = null
 
@@ -21,14 +21,6 @@ async function refresh() {
   } finally {
     loading.value = false
   }
-}
-
-function mjpegUrl(id: string): string {
-  return `/api/v1/streams/${id}/mjpeg`
-}
-
-function onPreviewError(id: string) {
-  failedPreviews.value = new Set(failedPreviews.value).add(id)
 }
 
 onMounted(() => {
@@ -66,12 +58,10 @@ onBeforeUnmount(() => {
         class="camera-tile"
       >
         <div class="tile-preview">
-          <img
-            v-if="cam.enabled && cam.status !== 'offline' && !failedPreviews.has(cam.id)"
-            :src="mjpegUrl(cam.id)"
-            :alt="cam.name"
-            class="tile-img"
-            @error="onPreviewError(cam.id)"
+          <LivePlayer
+            v-if="cam.enabled && cam.status !== 'offline'"
+            :camera-id="cam.id"
+            stream="sub"
           />
           <div v-else class="tile-placeholder">
             <span>{{ cam.enabled ? cam.status : 'disabled' }}</span>
@@ -139,11 +129,9 @@ onBeforeUnmount(() => {
   background: #000;
 }
 
-.tile-img {
-  width: 100%;
-  height: 100%;
-  object-fit: cover;
-  display: block;
+.tile-preview :deep(.live-player) {
+  position: absolute;
+  inset: 0;
 }
 
 .tile-placeholder {

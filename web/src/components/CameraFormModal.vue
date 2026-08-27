@@ -1,10 +1,25 @@
 <script setup lang="ts">
 import { computed, reactive, ref } from 'vue'
 import { post, patch, ApiError } from '../api/client'
-import type { Camera, CameraPayload, ProbeResponse, ProbeStream, RecordMode, Transport } from '../api/types'
+import type {
+  Camera,
+  CameraPayload,
+  OnvifProbeResponse,
+  PlaybackTranscode,
+  ProbeResponse,
+  ProbeStream,
+  RecordMode,
+  Transport,
+} from '../api/types'
+
+export interface CameraPrefill {
+  name?: string
+  onvif_endpoint?: string
+}
 
 const props = defineProps<{
   camera: Camera | null
+  prefill?: CameraPrefill | null
 }>()
 
 const emit = defineEmits<{
@@ -15,7 +30,7 @@ const emit = defineEmits<{
 const isEdit = computed(() => props.camera !== null)
 
 const form = reactive({
-  name: props.camera?.name ?? '',
+  name: props.camera?.name ?? props.prefill?.name ?? '',
   main_url: props.camera?.main_url ?? '',
   sub_url: props.camera?.sub_url ?? '',
   username: props.camera?.username ?? '',
@@ -24,6 +39,9 @@ const form = reactive({
   record_mode: (props.camera?.record_mode ?? 'continuous') as RecordMode,
   retention_days: props.camera?.retention_days ?? 7,
   retention_gb: props.camera?.retention_gb ?? 0,
+  onvif_endpoint: props.camera?.onvif_endpoint ?? props.prefill?.onvif_endpoint ?? '',
+  tier_after_days: props.camera?.tier_after_days ?? null as number | null,
+  playback_transcode: (props.camera?.playback_transcode ?? 'auto') as PlaybackTranscode,
 })
 
 const saving = ref(false)
@@ -31,6 +49,7 @@ const saveError = ref('')
 
 const probing = ref(false)
 const probeResult = ref<ProbeResponse | null>(null)
+const onvifResult = ref<OnvifProbeResponse | null>(null)
 const probeError = ref('')
 
 function describeStream(s: ProbeStream): string {
@@ -51,22 +70,40 @@ const probeSummary = computed(() => {
 async function testConnection() {
   probing.value = true
   probeResult.value = null
+  onvifResult.value = null
   probeError.value = ''
   try {
-    probeResult.value = await post<ProbeResponse>('/cameras/probe', {
-      url: form.main_url,
-      username: form.username || undefined,
-      password: form.password || undefined,
-      transport: form.transport,
-    })
-    if (!probeResult.value.ok) {
-      probeError.value = probeResult.value.error || 'Probe failed'
+    if (form.onvif_endpoint) {
+      onvifResult.value = await post<OnvifProbeResponse>('/cameras/probe', {
+        onvif_endpoint: form.onvif_endpoint,
+        username: form.username || undefined,
+        password: form.password || undefined,
+      })
+    } else {
+      probeResult.value = await post<ProbeResponse>('/cameras/probe', {
+        url: form.main_url,
+        username: form.username || undefined,
+        password: form.password || undefined,
+        transport: form.transport,
+      })
+      if (!probeResult.value.ok) {
+        probeError.value = probeResult.value.error || 'Probe failed'
+      }
     }
   } catch (err) {
     probeError.value = err instanceof ApiError ? err.message : 'Probe request failed'
   } finally {
     probing.value = false
   }
+}
+
+function useProfileStreams() {
+  const profiles = onvifResult.value?.profiles ?? []
+  const main = profiles.find((p) => p.stream_uri)
+  if (!main) return
+  form.main_url = main.stream_uri
+  const sub = profiles.find((p) => p.stream_uri && p.stream_uri !== main.stream_uri)
+  form.sub_url = sub ? sub.stream_uri : ''
 }
 
 async function save() {
@@ -83,6 +120,9 @@ async function save() {
     retention_days: form.retention_days,
     retention_gb: form.retention_gb || undefined,
   }
+  if (form.onvif_endpoint) payload.onvif_endpoint = form.onvif_endpoint
+  if (form.tier_after_days != null) payload.tier_after_days = form.tier_after_days
+  if (form.playback_transcode !== 'auto') payload.playback_transcode = form.playback_transcode
   try {
     if (props.camera) {
       await patch(`/cameras/${props.camera.id}`, payload)
@@ -111,12 +151,17 @@ async function save() {
 
         <label class="field">
           <span>Main stream URL <em>rtsp://…</em></span>
-          <input v-model="form.main_url" type="text" required placeholder="rtsp://192.168.1.50:554/stream1" />
+          <input v-model="form.main_url" type="text" :required="!form.onvif_endpoint" placeholder="rtsp://192.168.1.50:554/stream1" />
         </label>
 
         <label class="field">
           <span>Sub stream URL <em>optional</em></span>
           <input v-model="form.sub_url" type="text" placeholder="rtsp://192.168.1.50:554/stream2" />
+        </label>
+
+        <label class="field">
+          <span>ONVIF endpoint <em>optional — enables discovery, PTZ &amp; imaging</em></span>
+          <input v-model="form.onvif_endpoint" type="text" placeholder="http://192.168.1.50:80/onvif/device_service" />
         </label>
 
         <div class="field-row">
@@ -160,11 +205,26 @@ async function save() {
           </label>
         </div>
 
+        <div class="field-row">
+          <label class="field">
+            <span>Tier to S3 after (days) <em>blank = never</em></span>
+            <input v-model.number="form.tier_after_days" type="number" min="0" placeholder="—" />
+          </label>
+          <label class="field">
+            <span>Playback transcode</span>
+            <select v-model="form.playback_transcode">
+              <option value="auto">Auto</option>
+              <option value="never">Never</option>
+              <option value="always">Always</option>
+            </select>
+          </label>
+        </div>
+
         <div class="probe-row">
           <button
             class="btn btn-ghost"
             type="button"
-            :disabled="probing || !form.main_url"
+            :disabled="probing || (!form.main_url && !form.onvif_endpoint)"
             @click="testConnection"
           >
             <span v-if="probing" class="spinner" aria-hidden="true"></span>
@@ -172,6 +232,27 @@ async function save() {
           </button>
           <span v-if="probeResult?.ok" class="probe-ok">{{ probeSummary || 'Connected' }}</span>
           <span v-else-if="probeError" class="probe-error">{{ probeError }}</span>
+        </div>
+
+        <div v-if="onvifResult" class="onvif-result">
+          <p class="probe-ok onvif-device">
+            {{ [onvifResult.manufacturer, onvifResult.model].filter(Boolean).join(' ') || 'ONVIF device' }}
+            <span v-if="onvifResult.firmware_version" class="muted"> · fw {{ onvifResult.firmware_version }}</span>
+            <span class="muted"> · PTZ: {{ onvifResult.has_ptz ? 'yes' : 'no' }}</span>
+          </p>
+          <ul v-if="onvifResult.profiles?.length" class="profile-list">
+            <li v-for="p in onvifResult.profiles" :key="p.token">
+              {{ p.name || p.token }} — {{ p.codec.toUpperCase() }} {{ p.width }}×{{ p.height }}
+            </li>
+          </ul>
+          <button
+            v-if="onvifResult.profiles?.some((p) => p.stream_uri)"
+            class="btn btn-ghost btn-sm"
+            type="button"
+            @click="useProfileStreams"
+          >
+            Use profile streams
+          </button>
         </div>
 
         <p v-if="saveError" class="error-text">{{ saveError }}</p>
@@ -250,6 +331,31 @@ async function save() {
 .probe-error {
   color: var(--danger);
   font-size: 0.88rem;
+}
+
+.onvif-result {
+  margin: -0.4rem 0 1.1rem;
+}
+
+.onvif-device {
+  margin: 0 0 0.4rem;
+}
+
+.profile-list {
+  margin: 0 0 0.6rem;
+  padding-left: 1.2rem;
+  font-size: 0.88rem;
+  color: var(--text-muted);
+}
+
+.muted {
+  color: var(--text-muted);
+}
+
+.btn-sm {
+  padding: 0.35rem 0.7rem;
+  font-size: 0.85rem;
+  width: auto;
 }
 
 .spinner {

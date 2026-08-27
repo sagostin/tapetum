@@ -21,6 +21,7 @@ import (
 	"github.com/pion/rtp"
 
 	"github.com/sagostin/tapetum/internal/camera"
+	"github.com/sagostin/tapetum/internal/live"
 	"github.com/sagostin/tapetum/internal/record"
 	"github.com/sagostin/tapetum/internal/storage"
 	"github.com/sagostin/tapetum/internal/ws"
@@ -39,6 +40,7 @@ type cameraWorker struct {
 	segs    *record.Store
 	backend storage.Backend
 	hub     *ws.Hub
+	live    *live.Hub
 	snap    *snapshot
 	log     *slog.Logger
 
@@ -59,7 +61,7 @@ type cameraWorker struct {
 }
 
 func newCameraWorker(cam *camera.Camera, cams *camera.Store, segs *record.Store,
-	backend storage.Backend, hub *ws.Hub, snap *snapshot, log *slog.Logger,
+	backend storage.Backend, hub *ws.Hub, liveHub *live.Hub, snap *snapshot, log *slog.Logger,
 ) *cameraWorker {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &cameraWorker{
@@ -68,12 +70,14 @@ func newCameraWorker(cam *camera.Camera, cams *camera.Store, segs *record.Store,
 		segs:     segs,
 		backend:  backend,
 		hub:      hub,
+		live:     liveHub,
 		snap:     snap,
 		log:      log.With("camera", cam.Name, "camera_id", cam.ID),
 		ctx:      ctx,
 		cancel:   cancel,
 		recorder: record.NewRecorder(cam.ID, segs, backend),
 		detail:   map[string]any{},
+		status:   camera.StatusOffline, // zero value "" would violate the DB check
 	}
 }
 
@@ -306,6 +310,9 @@ func (w *cameraWorker) runSession(rawURL string, isSub bool) error {
 		return err
 	}
 
+	// reset live fan-out state for the new session (codec params may differ)
+	w.live.Begin(w.cam.ID, isSub, vcodec, sps, pps, vps)
+
 	w.startedAt = time.Now()
 	w.markUp(isSub, true)
 	if !isSub {
@@ -333,6 +340,9 @@ func (w *cameraWorker) onVideoAU(au [][]byte, pts int64, ptsOK bool, ntp time.Ti
 		if err := w.recorder.WriteVideo(au, pts, ntp); err != nil {
 			w.log.Warn("record write", "err", err)
 		}
+	}
+	if ptsOK {
+		w.live.Offer(w.cam.ID, isSub, au, pts)
 	}
 	w.snap.offer(au, vcodec, sps, pps, vps)
 }

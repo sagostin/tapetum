@@ -46,6 +46,15 @@ func (l *Local) FreeFrac() float64 {
 	return float64(st.Bavail) / float64(st.Blocks)
 }
 
+// Usage returns total and available bytes of the filesystem holding root.
+func (l *Local) Usage() (total, free uint64) {
+	var st syscall.Statfs_t
+	if err := syscall.Statfs(l.root, &st); err != nil {
+		return 0, 0
+	}
+	return st.Blocks * uint64(st.Bsize), st.Bavail * uint64(st.Bsize)
+}
+
 func (l *Local) Put(ctx context.Context, key string, r io.Reader, _ int64) error {
 	if l.FreeFrac() < l.minFreeFrac {
 		return ErrDiskFull

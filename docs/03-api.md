@@ -89,7 +89,7 @@ Camera create/update body:
 
 | Method | Path | Perm | Description |
 |---|---|---|---|
-| POST | `/streams/{cameraId}/webrtc` | live | WebRTC signaling: `{sdp_offer}` → `{sdp_answer}`. Trickle ICE via `PATCH` same path |
+| POST | `/streams/{cameraId}/webrtc` | live | WebRTC signaling: `{sdp, stream}` → `{sdp}` answer with all ICE candidates gathered server-side (no trickle). Errors: 409 `unsupported_codec` (H.265), 503 `stream_unavailable`, 429 `too_many_peers` — client falls back to MJPEG/HLS |
 | GET | `/streams/{cameraId}/mjpeg` | live | MJPEG fallback (sub-stream) |
 | GET | `/streams/{cameraId}/live.m3u8` | live | Short-window HLS of recent segments (near-live, ~10s delay) |
 | WS | `/ws` | any | Push channel: `camera.status`, `event.created`, `export.done`, `storage.warning` |
@@ -105,8 +105,8 @@ WS message envelope:
 | Method | Path | Perm | Description |
 |---|---|---|---|
 | GET | `/recordings/timeline?camera=&from=&to=&buckets=200` | playback | Timeline heatmap (below) |
-| GET | `/playback/{cameraId}/playlist.m3u8?start=&end=` | playback | On-demand HLS playlist from segment index |
-| GET | `/segments/{segmentId}` | playback | Segment bytes; local → file (Range ok), S3 → 302 presigned URL |
+| GET | `/playback/{cameraId}/playlist.m3u8?start=&end=` | playback | On-demand HLS playlist from segment index. `&transcode=1` rewrites init+segment URLs to lazily transcoded H.264 (H.265 cameras, cached in `data/transcode/`) |
+| GET | `/segments/{segmentId}` | playback | Segment bytes; local → file (Range ok), S3 → 302 presigned URL (15-min TTL). `?transcode=h264` serves the cached transcoded fragment |
 | GET | `/recordings/availability?camera=&from=&to=` | playback | `[{start, end}]` recorded ranges + gaps |
 | POST | `/exports` | export | `{camera_id, start, end}` → queued MP4 export (ffmpeg concat, `-c copy`) |
 | GET | `/exports` | export | Own exports (admin: all) |

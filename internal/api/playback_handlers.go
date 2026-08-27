@@ -2,7 +2,9 @@ package api
 
 import (
 	"encoding/base64"
+	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"strconv"
@@ -11,7 +13,9 @@ import (
 	"github.com/go-chi/chi/v5"
 
 	"github.com/sagostin/tapetum/internal/auth"
+	"github.com/sagostin/tapetum/internal/camera"
 	"github.com/sagostin/tapetum/internal/record"
+	"github.com/sagostin/tapetum/internal/transcode"
 )
 
 // parseTimeParam parses an RFC 3339 query param.
@@ -176,14 +180,20 @@ func (s *Server) availability(w http.ResponseWriter, r *http.Request) {
 
 // --- HLS playlists ----------------------------------------------------------
 
-// buildPlaylist renders a media playlist for segments (docs/05).
-func buildPlaylist(camID string, segs []*record.Segment, live bool) string {
+// buildPlaylist renders a media playlist for segments (docs/05). With
+// transcode=true the init + segment URLs point at lazily transcoded H.264
+// variants (H.265 cameras, unsupported browsers).
+func buildPlaylist(camID string, segs []*record.Segment, live bool, transcode bool) string {
 	var b []byte
 	p := func(format string, args ...any) {
 		b = append(b, fmt.Sprintf(format, args...)...)
 	}
 	p("#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-TARGETDURATION:10\n#EXT-X-MEDIA-SEQUENCE:0\n")
-	p("#EXT-X-MAP:URI=\"/api/v1/playback/%s/init.mp4\"\n", camID)
+	if transcode {
+		p("#EXT-X-MAP:URI=\"/api/v1/playback/%s/init.mp4?transcode=1\"\n", camID)
+	} else {
+		p("#EXT-X-MAP:URI=\"/api/v1/playback/%s/init.mp4\"\n", camID)
+	}
 	if live {
 		p("#EXT-X-PLAYLIST-TYPE:EVENT\n")
 	}
@@ -194,12 +204,22 @@ func buildPlaylist(camID string, segs []*record.Segment, live bool) string {
 		}
 		p("#EXT-X-PROGRAM-DATE-TIME:%s\n", s.Start.UTC().Format("2006-01-02T15:04:05.000Z"))
 		p("#EXTINF:%.3f,\n", dur)
-		p("/api/v1/segments/%s\n", s.ID)
+		if transcode {
+			p("/api/v1/segments/%s?transcode=h264\n", s.ID)
+		} else {
+			p("/api/v1/segments/%s\n", s.ID)
+		}
 	}
 	if !live {
 		p("#EXT-X-ENDLIST\n")
 	}
 	return string(b)
+}
+
+// wantsTranscode reports whether the client asked for transcoded H.264.
+func wantsTranscode(r *http.Request) bool {
+	v := r.URL.Query().Get("transcode")
+	return v == "1" || v == "true" || v == "h264"
 }
 
 func (s *Server) playbackPlaylist(w http.ResponseWriter, r *http.Request) {
@@ -225,7 +245,7 @@ func (s *Server) playbackPlaylist(w http.ResponseWriter, r *http.Request) {
 		Error(w, http.StatusNotFound, "no_recordings", "no recordings in range")
 		return
 	}
-	servePlaylist(w, buildPlaylist(cam.ID, segs, false))
+	servePlaylist(w, buildPlaylist(cam.ID, segs, false, wantsTranscode(r)))
 }
 
 func (s *Server) livePlaylist(w http.ResponseWriter, r *http.Request) {
@@ -244,7 +264,7 @@ func (s *Server) livePlaylist(w http.ResponseWriter, r *http.Request) {
 		Error(w, http.StatusNotFound, "no_recordings", "no recent segments")
 		return
 	}
-	servePlaylist(w, buildPlaylist(camID, segs, true))
+	servePlaylist(w, buildPlaylist(camID, segs, true, wantsTranscode(r)))
 }
 
 func servePlaylist(w http.ResponseWriter, pl string) {
@@ -254,6 +274,8 @@ func servePlaylist(w http.ResponseWriter, pl string) {
 }
 
 // initMP4 serves the camera's fMP4 init segment (from status_detail.init).
+// With ?transcode=1 it serves the cached transcoded H.264 init, generating
+// it from the newest segment on a cache miss.
 func (s *Server) initMP4(w http.ResponseWriter, r *http.Request) {
 	camID := chi.URLParam(r, "cameraId")
 	u := auth.UserFrom(r.Context())
@@ -266,15 +288,14 @@ func (s *Server) initMP4(w http.ResponseWriter, r *http.Request) {
 		Error(w, http.StatusNotFound, "camera_not_found", "camera not found")
 		return
 	}
-	initB64, _ := cam.StatusDetail["init"].(string)
-	if initB64 == "" {
-		Error(w, http.StatusNotFound, "no_init",
-			"codec init unavailable — camera has not streamed yet")
+	if wantsTranscode(r) {
+		s.serveTranscodeInit(w, r, cam)
 		return
 	}
-	initBytes, err := base64.StdEncoding.DecodeString(initB64)
+	initBytes, err := camInitBytes(cam)
 	if err != nil {
-		Error(w, http.StatusInternalServerError, "internal", err.Error())
+		Error(w, http.StatusNotFound, "no_init",
+			"codec init unavailable — camera has not streamed yet")
 		return
 	}
 	w.Header().Set("Content-Type", "video/mp4")
@@ -282,8 +303,58 @@ func (s *Server) initMP4(w http.ResponseWriter, r *http.Request) {
 	w.Write(initBytes)
 }
 
-// serveSegment streams a segment file with Range support (local storage).
-// Segments are immutable → year-long cache (docs/05).
+// camInitBytes decodes the base64 fMP4 init stored in status_detail.
+func camInitBytes(cam *camera.Camera) ([]byte, error) {
+	initB64, _ := cam.StatusDetail["init"].(string)
+	if initB64 == "" {
+		return nil, errors.New("no init")
+	}
+	return base64.StdEncoding.DecodeString(initB64)
+}
+
+// serveTranscodeInit serves (or builds) the transcoded H.264 init segment.
+func (s *Server) serveTranscodeInit(w http.ResponseWriter, r *http.Request, cam *camera.Camera) {
+	if cam.PlaybackTranscode == "never" {
+		Error(w, http.StatusBadRequest, "transcode_disabled",
+			"playback_transcode is 'never' for this camera")
+		return
+	}
+	path := s.transcode.InitPath(cam.ID)
+	if _, err := os.Stat(path); err != nil {
+		// build from the newest segment (writes the tinit cache as a side effect)
+		initBytes, err := camInitBytes(cam)
+		if err != nil {
+			Error(w, http.StatusNotFound, "no_init",
+				"codec init unavailable — camera has not streamed yet")
+			return
+		}
+		segs, err := s.segs.RecentSegments(r.Context(), cam.ID, 1)
+		if err != nil || len(segs) == 0 {
+			Error(w, http.StatusNotFound, "no_recordings", "no segments to transcode")
+			return
+		}
+		// drop any stale fragment cache so the build rewrites tinit
+		s.transcode.Evict(segs[0].ID)
+		if _, err := s.transcode.Segment(r.Context(), segs[0], initBytes, s.resolve); err != nil {
+			Error(w, http.StatusInternalServerError, "transcode_failed", err.Error())
+			return
+		}
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		Error(w, http.StatusInternalServerError, "transcode_failed", err.Error())
+		return
+	}
+	defer f.Close()
+	w.Header().Set("Content-Type", "video/mp4")
+	w.Header().Set("Cache-Control", "no-cache")
+	io.Copy(w, f)
+}
+
+// serveSegment streams a segment file with Range support. Local segments are
+// sent with sendfile; S3 segments redirect to a presigned GET (docs/06:
+// reads never proxy through Go). ?transcode=h264 serves a lazily transcoded
+// fragment (H.265 cameras). Segments are immutable → year-long cache.
 func (s *Server) serveSegment(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
 	seg, err := s.segs.GetSegment(r.Context(), id)
@@ -296,10 +367,28 @@ func (s *Server) serveSegment(w http.ResponseWriter, r *http.Request) {
 		Error(w, http.StatusNotFound, "segment_not_found", "segment not found")
 		return
 	}
-	if seg.Storage != "local" {
-		Error(w, http.StatusNotImplemented, "s3_tier", "S3 presign lands in phase 2")
+
+	if wantsTranscode(r) {
+		s.serveTranscodedSegment(w, r, seg)
 		return
 	}
+
+	if seg.Storage == "s3" {
+		b, err := s.s3m.Backend(r.Context())
+		if err != nil || b == nil {
+			Error(w, http.StatusServiceUnavailable, "s3_unavailable",
+				"segment is in S3 but S3 is not configured")
+			return
+		}
+		url, err := b.Presign(r.Context(), seg.Path, 15*time.Minute)
+		if err != nil {
+			Error(w, http.StatusInternalServerError, "presign_failed", err.Error())
+			return
+		}
+		http.Redirect(w, r, url, http.StatusFound)
+		return
+	}
+
 	rc, err := s.backend.Open(r.Context(), seg.Path)
 	if err != nil {
 		Error(w, http.StatusNotFound, "segment_missing", "segment file missing")
@@ -311,6 +400,64 @@ func (s *Server) serveSegment(w http.ResponseWriter, r *http.Request) {
 		Error(w, http.StatusInternalServerError, "internal", "unexpected backend reader")
 		return
 	}
+	w.Header().Set("Content-Type", "video/mp4")
+	w.Header().Set("Cache-Control", "immutable, max-age=31536000")
+	http.ServeContent(w, r, "", seg.Start, f)
+}
+
+// serveTranscodedSegment serves (or builds) the H.264 transcoded fragment.
+func (s *Server) serveTranscodedSegment(w http.ResponseWriter, r *http.Request, seg *record.Segment) {
+	cam, err := s.cams.Get(r.Context(), seg.CameraID)
+	if err != nil {
+		Error(w, http.StatusNotFound, "camera_not_found", "camera not found")
+		return
+	}
+	if cam.PlaybackTranscode == "never" {
+		Error(w, http.StatusBadRequest, "transcode_disabled",
+			"playback_transcode is 'never' for this camera")
+		return
+	}
+	// already H.264 — serve the original
+	if codec, _ := cam.StatusDetail["codec"].(string); codec == "h264" {
+		if seg.Storage != "local" {
+			Error(w, http.StatusBadRequest, "transcode_unneeded",
+				"segment is already H.264")
+			return
+		}
+		rc, err := s.backend.Open(r.Context(), seg.Path)
+		if err != nil {
+			Error(w, http.StatusNotFound, "segment_missing", "segment file missing")
+			return
+		}
+		defer rc.Close()
+		if f, ok := rc.(*os.File); ok {
+			w.Header().Set("Content-Type", "video/mp4")
+			w.Header().Set("Cache-Control", "immutable, max-age=31536000")
+			http.ServeContent(w, r, "", seg.Start, f)
+			return
+		}
+	}
+	initBytes, err := camInitBytes(cam)
+	if err != nil {
+		Error(w, http.StatusNotFound, "no_init",
+			"codec init unavailable — camera has not streamed yet")
+		return
+	}
+	path, err := s.transcode.Segment(r.Context(), seg, initBytes, s.resolve)
+	if errors.Is(err, transcode.ErrBusy) {
+		Error(w, http.StatusServiceUnavailable, "transcode_busy", err.Error())
+		return
+	}
+	if err != nil {
+		Error(w, http.StatusInternalServerError, "transcode_failed", err.Error())
+		return
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		Error(w, http.StatusInternalServerError, "transcode_failed", err.Error())
+		return
+	}
+	defer f.Close()
 	w.Header().Set("Content-Type", "video/mp4")
 	w.Header().Set("Cache-Control", "immutable, max-age=31536000")
 	http.ServeContent(w, r, "", seg.Start, f)

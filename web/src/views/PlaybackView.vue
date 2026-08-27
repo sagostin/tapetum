@@ -58,10 +58,29 @@ const playheadMs = computed(() => {
   return null
 })
 
+// HEVC support detection — drives the lazy H.265→H.264 transcode fallback.
+const hevcSupported = (() => {
+  const v = document.createElement('video')
+  const mime = 'video/mp4; codecs="hvc1.1.6.L93.B0"'
+  return (
+    v.canPlayType(mime) !== '' ||
+    (typeof MediaSource !== 'undefined' && MediaSource.isTypeSupported(mime))
+  )
+})()
+
+const isH265 = computed(() => camera.value?.status_detail?.codec === 'h265')
+const needsTranscode = computed(
+  () => isH265.value && camera.value?.playback_transcode !== 'never' && !hevcSupported,
+)
+const hevcBlocked = computed(
+  () => isH265.value && camera.value?.playback_transcode === 'never' && !hevcSupported,
+)
+
 function playlistFor(startMs: number, endMs: number): string {
   const start = new Date(startMs).toISOString()
   const end = new Date(endMs).toISOString()
-  return `/api/v1/playback/${cameraId}/playlist.m3u8?start=${encodeURIComponent(start)}&end=${encodeURIComponent(end)}`
+  const base = `/api/v1/playback/${cameraId}/playlist.m3u8?start=${encodeURIComponent(start)}&end=${encodeURIComponent(end)}`
+  return needsTranscode.value ? `${base}&transcode=1` : base
 }
 
 function startPlayback(startMs: number) {
@@ -87,6 +106,12 @@ function onTimeUpdate(seconds: number) {
 async function fetchCamera() {
   try {
     camera.value = await get<Camera>(`/cameras/${cameraId}`)
+    // Camera may arrive after playback auto-started — rebuild the playlist
+    // with the transcode flag when needed.
+    if (needsTranscode.value && playlistUrl.value && !playlistUrl.value.includes('transcode=1')) {
+      playlistUrl.value += '&transcode=1'
+      playerKey.value++
+    }
   } catch {
     // Non-fatal — header just shows less info.
   }
@@ -225,6 +250,11 @@ onBeforeUnmount(() => {
       </button>
     </div>
 
+    <p v-if="hevcBlocked" class="hevc-note">
+      This camera records H.265 and playback transcode is disabled — playback requires a
+      browser with HEVC support (e.g. Safari).
+    </p>
+
     <div class="player-wrap">
       <HlsPlayer
         v-if="playlistUrl"
@@ -318,6 +348,16 @@ onBeforeUnmount(() => {
 </template>
 
 <style scoped>
+.hevc-note {
+  margin: 0 0 0.75rem;
+  padding: 0.6rem 0.8rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-card);
+  color: var(--text-muted);
+  font-size: 0.85rem;
+}
+
 .page-title {
   margin: 0;
   font-size: 1.3rem;

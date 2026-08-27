@@ -15,15 +15,18 @@ import (
 type Janitor struct {
 	segs    *Store
 	cams    *camera.Store
-	backend storage.Backend
+	backend storage.Backend // local (write path)
+	resolve storage.Resolver
 	hub     *ws.Hub
 	log     *slog.Logger
 
 	lastWarn time.Time
 }
 
-func NewJanitor(segs *Store, cams *camera.Store, backend storage.Backend, hub *ws.Hub) *Janitor {
-	return &Janitor{segs: segs, cams: cams, backend: backend, hub: hub,
+func NewJanitor(segs *Store, cams *camera.Store, backend storage.Backend,
+	resolve storage.Resolver, hub *ws.Hub,
+) *Janitor {
+	return &Janitor{segs: segs, cams: cams, backend: backend, resolve: resolve, hub: hub,
 		log: slog.With("component", "janitor")}
 }
 
@@ -95,11 +98,13 @@ func (j *Janitor) evict(ctx context.Context, camID string, while func(*Segment) 
 		if !while(s) {
 			return
 		}
-		if s.Storage != "local" {
-			continue // S3 eviction lands with the S3 backend (phase 2)
+		b, err := j.resolve(ctx, s.Storage)
+		if err != nil {
+			j.log.Warn("resolve tier", "storage", s.Storage, "err", err)
+			continue
 		}
-		if err := j.backend.Delete(ctx, s.Path); err != nil {
-			j.log.Warn("delete object", "path", s.Path, "err", err)
+		if err := b.Delete(ctx, s.Path); err != nil {
+			j.log.Warn("delete object", "path", s.Path, "storage", s.Storage, "err", err)
 			continue
 		}
 		if err := j.segs.DeleteSegment(ctx, s.ID); err != nil {

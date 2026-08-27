@@ -8,6 +8,8 @@ const auth = useAuthStore()
 
 const user = computed(() => auth.user)
 const canPlayback = computed(() => auth.user?.permissions.includes('playback') ?? false)
+const canSettings = computed(() => auth.user?.permissions.includes('settings:write') ?? false)
+const canUsers = computed(() => auth.user?.permissions.includes('users:write') ?? false)
 
 async function logout() {
   await auth.logout()
@@ -24,13 +26,15 @@ async function logout() {
           <router-link to="/" class="nav-link" exact-active-class="nav-active">Dashboard</router-link>
           <router-link to="/cameras" class="nav-link" active-class="nav-active">Cameras</router-link>
           <router-link v-if="canPlayback" to="/playback" class="nav-link" active-class="nav-active">Playback</router-link>
+          <router-link v-if="canSettings" to="/admin/storage" class="nav-link" active-class="nav-active">Storage</router-link>
+          <router-link v-if="canUsers" to="/admin/system" class="nav-link" active-class="nav-active">System</router-link>
         </nav>
       </div>
       <div class="topbar-right">
-        <span v-if="user" class="user-chip">
+        <router-link v-if="user" to="/profile" class="user-chip user-chip-link">
           <span class="user-name">{{ user.display_name || user.username }}</span>
           <span class="user-role">{{ user.role }}</span>
-        </span>
+        </router-link>
         <button class="btn btn-ghost" type="button" @click="logout">Log out</button>
       </div>
     </header>
@@ -49,6 +53,10 @@ async function logout() {
 .nav-active {
   color: var(--text);
   background: var(--bg-card);
+}
+
+.user-chip-link {
+  text-decoration: none;
 }
 
 .content-area {
