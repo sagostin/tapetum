@@ -34,10 +34,11 @@ services:
       TAPETUM_ADDR: ":8080"
       TAPETUM_PPROF_ADDR: ${TAPETUM_PPROF_ADDR:-}
     sysctls:
-      # Larger kernel UDP receive buffers for RTSP-over-UDP ingest; prevents
-      # burst loss on high-bitrate cameras when transport=udp is used.
+      # Larger kernel UDP receive ceiling for RTSP-over-UDP ingest; lets the
+      # app's 4MB SO_RCVBUF absorb 8MP bitrate bursts when transport=udp.
+      # (rmem_default can't be namespaced by some runc/kernel combos — the
+      # app sets its own buffer size, so only the ceiling is needed.)
       net.core.rmem_max: 8388608
-      net.core.rmem_default: 1048576
     volumes:
       - tapetum-data:/data
     depends_on:

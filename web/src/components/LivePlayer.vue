@@ -45,6 +45,7 @@ const rootEl = ref<HTMLDivElement | null>(null)
 let cleanup: (() => void) | null = null
 let inFlight = false
 let visible = false
+let destroyed = false
 let observer: IntersectionObserver | null = null
 let pendingStart = false
 
@@ -71,13 +72,23 @@ async function start() {
   inFlight = true
   await acquireWebRTCSlot()
   try {
-    cleanup = await startWebRTC(
+    // Navigated away / scrolled off while queued for a slot — don't set up
+    // a connection nobody is looking at.
+    if (destroyed || !visible) return
+    const c = await startWebRTC(
       video,
       props.cameraId,
       props.stream,
       { post: (path, body) => post(path, body) },
       () => setMode('mjpeg'),
     )
+    // Unmounted or hidden while setup was in flight — close the connection
+    // immediately instead of leaking a stream that keeps downloading.
+    if (destroyed || !visible) {
+      c()
+      return
+    }
+    cleanup = c
   } finally {
     inFlight = false
     releaseWebRTCSlot()
@@ -107,6 +118,11 @@ onMounted(() => {
           } else {
             // Free the slot + connection immediately when scrolled away.
             stop()
+            // MJPEG mode: stop() can't close the <img>'s multipart stream —
+            // flipping back to webrtc removes the img from the DOM, which
+            // does. On scroll-in, WebRTC is retried (and re-falls-back if
+            // still unavailable).
+            if (mode.value === 'mjpeg') setMode('webrtc')
           }
         }
       },
@@ -145,6 +161,7 @@ const mediaTransform = computed(() => {
 const isRotated = computed(() => props.rotate === 90 || props.rotate === 270)
 
 onBeforeUnmount(() => {
+  destroyed = true
   stop()
   if (observer) {
     observer.disconnect()
