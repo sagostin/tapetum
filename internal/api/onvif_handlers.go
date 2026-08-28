@@ -48,7 +48,23 @@ func (s *Server) onvifProfileOrFirst(r *http.Request, cam *camera.Camera,
 	return res.Profiles[0].Token, nil
 }
 
-// discover runs an ONVIF WS-Discovery scan of the LAN (rate-limited, docs/03).
+// discover runs an ONVIF discovery scan of the LAN (rate-limited, docs/03).
+//
+// Body (all fields optional):
+//
+//	{
+//	  "mode":      "multicast" | "network" | "host",  // default "multicast"
+//	  "timeout_s": <int>,                            // multicast only (1..30)
+//	  "network":   "192.168.1.0/24",                 // required when mode=network
+//	  "host":      "192.168.1.50" | "camera.lan",    // required when mode=host
+//	  "username":  "admin",                          // optional, applies to network/host
+//	  "password":  "…"
+//	}
+//
+// "multicast" runs WS-Discovery (no credentials needed). "network" expands a
+// CIDR and probes every IP at common ONVIF ports/paths with the given
+// credentials. "host" probes a single IP or hostname the same way. The same
+// response envelope (`{devices: [...]}`) is returned in every mode.
 func (s *Server) discoverCameras(w http.ResponseWriter, r *http.Request) {
 	u := auth.UserFrom(r.Context())
 	if !s.probeLimiter.allow(u.ID) {
@@ -56,23 +72,79 @@ func (s *Server) discoverCameras(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var b struct {
-		TimeoutS int `json:"timeout_s"`
+		TimeoutS int    `json:"timeout_s"`
+		Mode     string `json:"mode"`
+		Network  string `json:"network"`
+		Host     string `json:"host"`
+		Username string `json:"username"`
+		Password string `json:"password"`
 	}
 	_ = Decode(w, r, &b) // body optional
-	timeout := 5 * time.Second
-	if b.TimeoutS > 0 && b.TimeoutS <= 30 {
-		timeout = time.Duration(b.TimeoutS) * time.Second
+
+	mode := b.Mode
+	if mode == "" {
+		mode = "multicast"
 	}
-	ctx, cancel := context.WithTimeout(r.Context(), timeout+5*time.Second)
-	defer cancel()
-	devs, err := onvif.Discover(ctx, timeout)
-	if err != nil {
-		Error(w, http.StatusBadGateway, "discovery_failed", err.Error())
+
+	var (
+		devs []*onvif.DiscoveredDevice
+		err  error
+	)
+	switch mode {
+	case "multicast":
+		timeout := 5 * time.Second
+		if b.TimeoutS > 0 && b.TimeoutS <= 30 {
+			timeout = time.Duration(b.TimeoutS) * time.Second
+		}
+		ctx, cancel := context.WithTimeout(r.Context(), timeout+5*time.Second)
+		defer cancel()
+		devs, err = onvif.Discover(ctx, timeout)
+
+	case "network":
+		if b.Network == "" {
+			Error(w, http.StatusBadRequest, "bad_request", "network is required for mode=network")
+			return
+		}
+		hosts, herr := onvif.CIDRHosts(b.Network)
+		if herr != nil {
+			Error(w, http.StatusBadRequest, "bad_request", herr.Error())
+			return
+		}
+		ctx, cancel := context.WithTimeout(r.Context(), 45*time.Second)
+		defer cancel()
+		devs, err = onvif.ScanHosts(ctx, hosts, b.Username, b.Password, onvif.ScanOptions{})
+
+	case "host":
+		if b.Host == "" {
+			Error(w, http.StatusBadRequest, "bad_request", "host is required for mode=host")
+			return
+		}
+		hosts, herr := onvif.ResolveHost(b.Host)
+		if herr != nil {
+			Error(w, http.StatusBadRequest, "bad_request", herr.Error())
+			return
+		}
+		ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
+		defer cancel()
+		devs, err = onvif.ScanHosts(ctx, hosts, b.Username, b.Password, onvif.ScanOptions{})
+
+	default:
+		Error(w, http.StatusBadRequest, "bad_request",
+			`mode must be one of "multicast", "network", "host"`)
 		return
+	}
+
+	if err != nil {
+		// Network/host scans can return partial results alongside the error
+		// (e.g. context deadline exceeded after finding some devices).
+		if devs == nil {
+			Error(w, http.StatusBadGateway, "discovery_failed", err.Error())
+			return
+		}
 	}
 	audit.Log(r.Context(), s.pool, audit.Entry{
 		UserID: u.ID, Action: "camera.discover", IP: clientIP(r),
-		Detail: map[string]any{"found": len(devs)},
+		Detail: map[string]any{"mode": mode, "found": len(devs)},
 	})
 	JSON(w, http.StatusOK, map[string]any{"devices": devs})
 }

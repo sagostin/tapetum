@@ -7,6 +7,9 @@ export interface Toast {
   link?: string
 }
 
+const MAX_TOASTS = 8
+const TOAST_TTL_MS = 6000
+
 let nextId = 1
 
 export const useToastStore = defineStore('toasts', {
@@ -15,10 +18,14 @@ export const useToastStore = defineStore('toasts', {
     push(kind: Toast['kind'], text: string, link?: string) {
       const toast: Toast = { id: nextId++, kind, text, link }
       this.toasts.push(toast)
-      setTimeout(() => this.dismiss(toast.id), 6000)
+      if (this.toasts.length > MAX_TOASTS) {
+        this.toasts.splice(0, this.toasts.length - MAX_TOASTS)
+      }
+      setTimeout(() => this.dismiss(toast.id), TOAST_TTL_MS)
     },
     dismiss(id: number) {
-      this.toasts = this.toasts.filter((t) => t.id !== id)
+      const i = this.toasts.findIndex((t) => t.id === id)
+      if (i >= 0) this.toasts.splice(i, 1)
     },
   },
 })

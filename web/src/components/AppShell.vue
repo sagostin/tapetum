@@ -3,11 +3,13 @@ import { computed, onBeforeUnmount, onMounted } from 'vue'
 import { useRouter } from 'vue-router'
 import { useAuthStore } from '../stores/auth'
 import { useToastStore } from '../stores/toasts'
+import { useCamerasStore } from '../stores/cameras'
 import { wsClient } from '../lib/ws'
 
 const router = useRouter()
 const auth = useAuthStore()
 const toasts = useToastStore()
+const cameras = useCamerasStore()
 
 const user = computed(() => auth.user)
 const canPlayback = computed(() => auth.user?.permissions.includes('playback') ?? false)
@@ -20,10 +22,23 @@ let offFns: (() => void)[] = []
 onMounted(() => {
   wsClient.connect()
   offFns = [
+    wsClient.on('camera.status', (data) => {
+      const d = data as { camera_id?: string; status?: 'online' | 'offline' | 'degraded'; detail?: Record<string, unknown> }
+      if (!d?.camera_id || !d.status) return
+      const prev = cameras.byId(d.camera_id)?.status
+      cameras.applyStatus(d.camera_id, d.status, d.detail)
+      if (prev && prev !== d.status) {
+        if (d.status === 'online') {
+          toasts.push('success', `${cameras.byId(d.camera_id)?.name ?? 'Camera'} back online`)
+        } else if (d.status === 'offline') {
+          toasts.push('error', `${cameras.byId(d.camera_id)?.name ?? 'Camera'} went offline`)
+        }
+      }
+    }),
     wsClient.on('event.created', (data) => {
       const d = data as { id?: string; type?: string }
       const what = d?.type === 'ai' ? 'Detection' : 'Motion'
-      toasts.push('info', `${what} event`, d?.id ? `/events?id=${d.id}` : '/events')
+      toasts.push('info', `${what} event`, d?.id ? `/events?id=${d.id}` : undefined)
     }),
     wsClient.on('export.done', (data) => {
       const d = data as { id?: string }

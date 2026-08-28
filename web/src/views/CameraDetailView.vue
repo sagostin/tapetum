@@ -4,12 +4,12 @@ import { useRoute, useRouter } from 'vue-router'
 import { get, post, put, ApiError } from '../api/client'
 import type {
   Camera,
-  CameraListResponse,
   CameraStats,
   ImagingSettings,
   OnvifSyncResponse,
 } from '../api/types'
 import { useAuthStore } from '../stores/auth'
+import { useCamerasStore } from '../stores/cameras'
 import { formatBytes, formatDuration } from '../utils/format'
 import StatusBadge from '../components/StatusBadge.vue'
 import LivePlayer from '../components/LivePlayer.vue'
@@ -19,15 +19,21 @@ import PtzPad from '../components/PtzPad.vue'
 const route = useRoute()
 const router = useRouter()
 const auth = useAuthStore()
+const cams = useCamerasStore()
 const cameraId = computed(() => route.params.id as string)
 
 const canPlayback = computed(() => auth.user?.permissions.includes('playback') ?? false)
 const canPtz = computed(() => auth.user?.permissions.includes('ptz') ?? false)
 const canWrite = computed(() => auth.user?.permissions.includes('cameras:write') ?? false)
 
+// Camera + stats: fetched on mount and when the route changes. The camera
+// store is the source of truth for camera metadata (it gets WS-driven status
+// updates); this view only fetches detail bits not in the store. Stats poll
+// is throttled to 15s since bitrate/fps aren't on the WS yet — once they
+// are, drop the poll entirely.
 const camera = ref<Camera | null>(null)
 const stats = ref<CameraStats | null>(null)
-const allCameras = ref<Camera[]>([])
+const allCameras = computed<Camera[]>(() => cams.list)
 const loadError = ref('')
 const streamSource = ref<'main' | 'sub'>('main')
 
@@ -42,7 +48,10 @@ let cycleTimer: ReturnType<typeof setInterval> | null = null
 
 let pollTimer: ReturnType<typeof setInterval> | null = null
 
-const status = computed(() => stats.value?.status ?? camera.value?.status ?? 'offline')
+const status = computed(() => {
+  const fromWs = cams.byId(cameraId.value)?.status
+  return stats.value?.status ?? fromWs ?? camera.value?.status ?? 'offline'
+})
 
 const showPtz = computed(() => canPtz.value && camera.value?.has_ptz === true)
 const showImaging = computed(() => canPtz.value && !!camera.value?.onvif_endpoint)
@@ -72,18 +81,20 @@ const NUMERIC_IMAGING_FIELDS = [
 async function refresh() {
   const id = cameraId.value
   try {
-    const [cam, st, list] = await Promise.all([
+    const [cam, st] = await Promise.all([
       get<Camera>(`/cameras/${id}`),
       get<CameraStats>(`/cameras/${id}/stats`),
-      get<CameraListResponse>('/cameras'),
     ])
     camera.value = cam
     stats.value = st
-    allCameras.value = list.cameras ?? []
     loadError.value = ''
   } catch {
     if (!camera.value) loadError.value = 'Failed to load camera'
   }
+}
+
+async function ensureCamerasLoaded() {
+  if (!cams.loaded) await cams.refresh()
 }
 
 const currentIndex = computed(() =>
@@ -196,8 +207,12 @@ async function applyImaging() {
 }
 
 onMounted(() => {
+  ensureCamerasLoaded()
   refresh()
-  pollTimer = setInterval(refresh, 5000)
+  // 15s stats poll — bitrate/fps aren't on the WS yet. The camera store
+  // handles status transitions over WS, so this only refreshes the stats
+  // panel (bitrate/fps/uptime).
+  pollTimer = setInterval(refresh, 15_000)
   window.addEventListener('keydown', onKeyDown)
 })
 

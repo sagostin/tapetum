@@ -69,6 +69,7 @@ func main() {
 	slog.Info("database migrated")
 
 	hub := ws.NewHub()
+	hub.SetDev(cfg.Server.Dev)
 	liveHub := live.NewHub()
 
 	backend, err := storage.NewLocal(cfg.Server.DataDir)

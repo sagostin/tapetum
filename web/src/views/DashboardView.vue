@@ -9,53 +9,38 @@
  * /cameras/:id/display so they survive reloads and follow the user across
  * browsers. The wall scrolls vertically when there are more cameras than
  * fit on one screen.
+ *
+ * Data flow: the cameras Pinia store is the single source of truth. AppShell
+ * subscribes to the `camera.status` WebSocket topic and pushes transitions
+ * into the store. The wall loads the list once on mount and only re-fetches
+ * when the page becomes visible again (catches camera CRUD that happened
+ * while the tab was backgrounded) — no N+1 stats polling, no per-second
+ * wholesale array replacement.
  */
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
-import { get } from '../api/client'
 import { patchCameraDisplay } from '../api/cameras'
-import type {
-  Camera,
-  CameraListResponse,
-  CameraStats,
-  DisplayRotate,
-} from '../api/types'
+import { useCamerasStore } from '../stores/cameras'
+import type { Camera, DisplayRotate } from '../api/types'
 import StatusBadge from '../components/StatusBadge.vue'
 import LivePlayer from '../components/LivePlayer.vue'
 
 const router = useRouter()
-const cameras = ref<Camera[]>([])
-const stats = ref<Record<string, CameraStats>>({})
-const loading = ref(true)
+const store = useCamerasStore()
+const cameras = computed<Camera[]>(() => store.list)
+const loading = computed(() => !store.loaded)
 const loadError = ref('')
 const streamSource = ref<'main' | 'sub'>('sub')
 const globalFit = ref<'contain' | 'cover'>('contain')
 
 let pollTimer: ReturnType<typeof setInterval> | null = null
 
-// ---- data loading ---------------------------------------------------------
-
 async function refresh() {
   try {
-    const [list, ...statResults] = await Promise.all([
-      get<CameraListResponse>('/cameras'),
-      ...cameras.value.map((c) =>
-        get<CameraStats>(`/cameras/${c.id}/stats`)
-          .then((s) => ({ id: c.id, stats: s }))
-          .catch(() => null),
-      ),
-    ])
-    cameras.value = list.cameras ?? []
+    await store.refresh()
     loadError.value = ''
-    const newStats: Record<string, CameraStats> = {}
-    for (const r of statResults) {
-      if (r) newStats[r.id] = r.stats
-    }
-    stats.value = newStats
   } catch {
-    if (!cameras.value.length) loadError.value = 'Failed to load cameras'
-  } finally {
-    loading.value = false
+    if (!store.list.length) loadError.value = 'Failed to load cameras'
   }
 }
 
@@ -67,7 +52,6 @@ function openCamera(id: string) {
 
 // ---- display persistence -------------------------------------------------
 
-// Per-tile fit override; null = use the toolbar globalFit.
 const tileFit = ref<Record<string, 'contain' | 'cover'>>({})
 
 function effectiveFit(cam: Camera): 'contain' | 'cover' {
@@ -82,17 +66,15 @@ function toggleTileFit(cam: Camera) {
   }
 }
 
-// Display transforms are persisted immediately, but we keep a small pending
-// queue so rapid rotations debounce to one PATCH per camera.
 const saveTimers: Record<string, ReturnType<typeof setTimeout>> = {}
 function queueDisplaySave(
   cam: Camera,
   patch: { rotate?: DisplayRotate; hflip?: boolean; vflip?: boolean },
 ) {
-  // Optimistically mutate the camera locally so the UI updates instantly.
   if (patch.rotate !== undefined) cam.display_rotate = patch.rotate
   if (patch.hflip !== undefined) cam.display_hflip = patch.hflip
   if (patch.vflip !== undefined) cam.display_vflip = patch.vflip
+  store.upsert(cam)
 
   const id = cam.id
   if (saveTimers[id]) clearTimeout(saveTimers[id])
@@ -144,17 +126,16 @@ function resetDisplay(cam: Camera) {
   })
 }
 
-// ---- cycle ---------------------------------------------------------------
-// The cycle feature moved to /cameras/:id (CameraDetailView), where the UI3
-// detail pane benefits more from auto-advancing through the camera list.
-
 function setStreamSource(s: 'main' | 'sub') {
   streamSource.value = s
 }
 
 onMounted(() => {
   refresh()
-  pollTimer = setInterval(refresh, 5000)
+  // Slow reconciliation poll — catches cameras added/removed/renamed by
+  // other admins while this tab was open. 30s is plenty; status changes
+  // come over WS and don't need polling.
+  pollTimer = setInterval(refresh, 30_000)
 })
 
 onBeforeUnmount(() => {
@@ -209,7 +190,6 @@ const onlineCount = computed(
             title="Main stream (full resolution)"
           >Main</button>
         </div>
-        <!-- Cycle moved to /cameras/:id -->
       </div>
     </header>
 
@@ -250,13 +230,11 @@ const onlineCount = computed(
           <span>{{ cam.enabled ? cam.status : 'disabled' }}</span>
         </div>
 
-        <!-- Always-on bottom-left overlay: camera name + status. -->
         <div class="tile-meta">
           <span class="tile-name">{{ cam.name }}</span>
           <StatusBadge :status="cam.status" compact />
         </div>
 
-        <!-- Hover-revealed tile controls (UI3 wall menu). -->
         <div class="tile-controls" @click.stop>
           <button
             class="tile-btn"
@@ -275,7 +253,7 @@ const onlineCount = computed(
           <button
             class="tile-btn"
             type="button"
-            :class="{ 'tile-btn-active': cam.display_hflip }"
+            :class="{ 'tool-btn-active': cam.display_hflip }"
             @click.stop="toggleHFlip(cam)"
             title="Horizontal flip"
             aria-label="Horizontal flip"
@@ -283,7 +261,7 @@ const onlineCount = computed(
           <button
             class="tile-btn"
             type="button"
-            :class="{ 'tile-btn-active': cam.display_vflip }"
+            :class="{ 'tool-btn-active': cam.display_vflip }"
             @click.stop="toggleVFlip(cam)"
             title="Vertical flip"
             aria-label="Vertical flip"
@@ -291,7 +269,7 @@ const onlineCount = computed(
           <button
             class="tile-btn"
             type="button"
-            :class="{ 'tile-btn-active': effectiveFit(cam) === 'cover' }"
+            :class="{ 'tool-btn-active': effectiveFit(cam) === 'cover' }"
             @click.stop="toggleTileFit(cam)"
             :title="effectiveFit(cam) === 'contain' ? 'Fill (crop to tile)' : 'Fit (letterbox)'"
             :aria-label="effectiveFit(cam) === 'contain' ? 'Fill' : 'Fit'"

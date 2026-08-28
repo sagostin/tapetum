@@ -2,6 +2,7 @@
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { post } from '../api/client'
 import { startWebRTC } from '../lib/webrtc'
+import { acquireWebRTCSlot, releaseWebRTCSlot } from '../lib/webrtc-slot'
 import type { DisplayRotate } from '../api/types'
 
 type Fit = 'contain' | 'cover'
@@ -39,8 +40,13 @@ const emit = defineEmits<{
 
 const mode = ref<'webrtc' | 'mjpeg'>('webrtc')
 const videoEl = ref<HTMLVideoElement | null>(null)
+const rootEl = ref<HTMLDivElement | null>(null)
 
 let cleanup: (() => void) | null = null
+let inFlight = false
+let visible = false
+let observer: IntersectionObserver | null = null
+let pendingStart = false
 
 const mjpegUrl = () => `/api/v1/streams/${props.cameraId}/mjpeg`
 
@@ -51,16 +57,31 @@ function setMode(m: 'webrtc' | 'mjpeg') {
 }
 
 async function start() {
+  // Don't even attempt WebRTC for off-screen tiles — saves a full RTCPeerConnection
+  // setup (~2s of ICE gathering on the main thread) per hidden tile and stops the
+  // dashboard from locking up on first paint with many cameras.
+  if (!visible) {
+    pendingStart = true
+    return
+  }
+  if (inFlight) return
   stop()
   const video = videoEl.value
   if (!video) return
-  cleanup = await startWebRTC(
-    video,
-    props.cameraId,
-    props.stream,
-    { post: (path, body) => post(path, body) },
-    () => setMode('mjpeg'),
-  )
+  inFlight = true
+  await acquireWebRTCSlot()
+  try {
+    cleanup = await startWebRTC(
+      video,
+      props.cameraId,
+      props.stream,
+      { post: (path, body) => post(path, body) },
+      () => setMode('mjpeg'),
+    )
+  } finally {
+    inFlight = false
+    releaseWebRTCSlot()
+  }
 }
 
 function stop() {
@@ -70,7 +91,34 @@ function stop() {
   }
 }
 
-onMounted(start)
+onMounted(() => {
+  // Observe visibility on the wrapper (the <video> itself is hidden until webrtc
+  // mode wins, so its bounding box is 0×0 and the observer would never fire).
+  if (rootEl.value && typeof IntersectionObserver !== 'undefined') {
+    observer = new IntersectionObserver(
+      (entries) => {
+        for (const entry of entries) {
+          visible = entry.isIntersecting
+          if (visible) {
+            if (pendingStart || !cleanup) {
+              pendingStart = false
+              start()
+            }
+          } else {
+            // Free the slot + connection immediately when scrolled away.
+            stop()
+          }
+        }
+      },
+      { threshold: 0.05 },
+    )
+    observer.observe(rootEl.value)
+  } else {
+    // Fallback: assume visible so non-IntersectionObserver browsers still work.
+    visible = true
+    start()
+  }
+})
 
 watch(
   () => [props.cameraId, props.stream],
@@ -96,13 +144,19 @@ const mediaTransform = computed(() => {
 // Rotate 90 / 270 swap the tile aspect ratio; the wrapper applies this.
 const isRotated = computed(() => props.rotate === 90 || props.rotate === 270)
 
-onBeforeUnmount(stop)
+onBeforeUnmount(() => {
+  stop()
+  if (observer) {
+    observer.disconnect()
+    observer = null
+  }
+})
 
 defineExpose({ mode })
 </script>
 
 <template>
-  <div class="live-player" :class="{ 'live-rotated': isRotated }">
+  <div ref="rootEl" class="live-player" :class="{ 'live-rotated': isRotated }">
     <div class="live-frame">
       <video
         v-show="mode === 'webrtc'"

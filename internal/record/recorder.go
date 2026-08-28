@@ -84,16 +84,19 @@ func (r *Recorder) SetMode(mode string) {
 // on deactivation the current segment is closed.
 func (r *Recorder) MotionActive(active bool) {
 	r.mu.Lock()
-	defer r.mu.Unlock()
+	var job *marshalJob
 	if r.mode != "motion" || active == r.motionActive {
+		r.mu.Unlock()
 		return
 	}
 	r.motionActive = active
 	if !active {
 		if r.open {
-			if err := r.closeLocked(time.Now()); err != nil {
-				r.log.Warn("motion segment close failed", "err", err)
-			}
+			job = r.cutLocked(time.Now())
+		}
+		r.mu.Unlock()
+		if job != nil {
+			r.marshalAndFlush(job)
 		}
 		return
 	}
@@ -104,6 +107,7 @@ func (r *Recorder) MotionActive(active bool) {
 		r.startNTP = r.vNTP[0]
 		r.lastNTP = r.vNTP[len(r.vNTP)-1]
 	}
+	r.mu.Unlock()
 }
 
 // SetVideoCodec selects the video codec ("h264"/"h265"). Must be called
@@ -128,15 +132,31 @@ func (r *Recorder) isRandomAccess(au [][]byte) bool {
 	return h264.IsRandomAccess(au)
 }
 
+// marshalJob carries the raw per-track sample lists out of the recorder lock
+// so the fMP4 marshal (CPU-bound, ~ms per segment) doesn't block incoming
+// packets on the next camera in the burst cut window.
+type marshalJob struct {
+	seq    uint32
+	start  time.Time
+	end    time.Time
+	v      []*fmp4.Sample
+	vPTS   []int64
+	vFirst int64
+	a      []*fmp4.Sample
+	aPTS   []int64
+	aFirst int64
+	aRate  int64
+}
+
 // WriteVideo appends a video access unit. pts is in 90 kHz units; ntp is the
 // wall-clock time of the AU (from RTCP mapping or arrival time fallback).
 func (r *Recorder) WriteVideo(au [][]byte, pts int64, ntp time.Time) error {
 	randAcc := r.isRandomAccess(au)
 
 	r.mu.Lock()
-	defer r.mu.Unlock()
 
 	if r.mode == "off" {
+		r.mu.Unlock()
 		return nil
 	}
 
@@ -144,6 +164,7 @@ func (r *Recorder) WriteVideo(au [][]byte, pts int64, ntp time.Time) error {
 		// ring buffer: keep the last preRollRing of decodable GOPs, never persist
 		avcc, err := h264.AVCC(au).Marshal()
 		if err != nil {
+			r.mu.Unlock()
 			return err
 		}
 		r.vSamples = append(r.vSamples, &fmp4.Sample{
@@ -153,21 +174,24 @@ func (r *Recorder) WriteVideo(au [][]byte, pts int64, ntp time.Time) error {
 		r.vPTS = append(r.vPTS, pts)
 		r.vNTP = append(r.vNTP, ntp)
 		r.trimRingLocked()
+		r.mu.Unlock()
 		return nil
 	}
 
+	var job *marshalJob
 	if !r.open {
 		if !randAcc {
+			r.mu.Unlock()
 			return nil // wait for an IDR to open a segment
 		}
 		r.open = true
 		r.vFirstPTS = pts
 		r.startNTP = ntp
 	} else if randAcc && ntp.Sub(r.startNTP) >= targetSegDur {
-		// cut before this IDR: it starts the next segment
-		if err := r.closeLocked(ntp); err != nil {
-			r.log.Warn("segment close failed", "err", err)
-		}
+		// cut before this IDR: it starts the next segment. Snapshot the old
+		// segment under the lock; marshal + Put + Insert all happen in a
+		// goroutine so the next packet isn't blocked on encoding + IO.
+		job = r.cutForNewSegmentLocked(ntp)
 		r.open = true
 		r.vFirstPTS = pts
 		r.startNTP = ntp
@@ -175,6 +199,7 @@ func (r *Recorder) WriteVideo(au [][]byte, pts int64, ntp time.Time) error {
 
 	avcc, err := h264.AVCC(au).Marshal()
 	if err != nil {
+		r.mu.Unlock()
 		return err
 	}
 	r.vSamples = append(r.vSamples, &fmp4.Sample{
@@ -183,6 +208,11 @@ func (r *Recorder) WriteVideo(au [][]byte, pts int64, ntp time.Time) error {
 	})
 	r.vPTS = append(r.vPTS, pts)
 	r.lastNTP = ntp
+	r.mu.Unlock()
+
+	if job != nil {
+		go r.marshalAndFlush(job)
+	}
 	return nil
 }
 
@@ -232,20 +262,40 @@ func (r *Recorder) WriteAudio(au []byte, pts int64) error {
 // Close flushes any open segment (disconnect/shutdown).
 func (r *Recorder) Close() {
 	r.mu.Lock()
-	defer r.mu.Unlock()
+	var job *marshalJob
 	if r.open {
-		if err := r.closeLocked(time.Now()); err != nil {
-			r.log.Warn("segment flush failed", "err", err)
-		}
+		job = r.cutLocked(time.Now())
+	}
+	r.mu.Unlock()
+
+	if job != nil {
+		r.marshalAndFlush(job)
 	}
 }
 
-// closeLocked finalizes the open segment: assigns durations, marshals the
-// fMP4 part, stores the file, and inserts the index row.
-// nextSegStart is the wall time of the next segment's first frame (used only
-// as a fallback end time).
-func (r *Recorder) closeLocked(nextSegStart time.Time) error {
+// cutForNewSegmentLocked hands the open segment's samples off to the marshal
+// pipeline and resets per-segment state. Caller must hold r.mu and have
+// already decided a new segment starts here (state for the new segment is
+// set by the caller). The returned marshalJob is what gets sent to a marshal
+// goroutine; the marshal + Put + Insert happen outside the recorder lock.
+func (r *Recorder) cutForNewSegmentLocked(nextSegStart time.Time) *marshalJob {
 	r.open = false
+	return r.snapshotLocked(nextSegStart)
+}
+
+// cutLocked is Close's variant — drains the open segment using the given
+// fallback end time. Caller must hold r.mu.
+func (r *Recorder) cutLocked(nextSegStart time.Time) *marshalJob {
+	r.open = false
+	return r.snapshotLocked(nextSegStart)
+}
+
+// snapshotLocked copies the open segment's per-track samples into a marshal
+// job and resets per-segment state. The fMP4 marshal happens off-lock in
+// marshalAndFlush so the next packet for this camera isn't blocked waiting
+// for the encoder.
+// Caller must hold r.mu.
+func (r *Recorder) snapshotLocked(nextSegStart time.Time) *marshalJob {
 	defer func() {
 		r.vSamples, r.vPTS, r.vNTP = nil, nil, nil
 		r.aSamples, r.aPTS = nil, nil
@@ -274,40 +324,58 @@ func (r *Recorder) closeLocked(nextSegStart time.Time) error {
 		end = nextSegStart
 	}
 
+	r.seq++
+	return &marshalJob{
+		seq:    r.seq,
+		start:  start,
+		end:    end,
+		v:      r.vSamples,
+		vPTS:   r.vPTS,
+		vFirst: r.vFirstPTS,
+		a:      r.aSamples,
+		aPTS:   r.aPTS,
+		aFirst: r.aFirstPTS,
+		aRate:  r.audioRate,
+	}
+}
+
+// marshalAndFlush marshals the snapshot into fMP4 and persists it. Runs
+// outside the recorder lock so the next packet isn't blocked on the encoder
+// or storage IO. Called from a goroutine spawned by WriteVideo / Close /
+// MotionActive.
+func (r *Recorder) marshalAndFlush(job *marshalJob) {
 	tracks := []*fmp4.PartTrack{{
 		ID:       1,
-		BaseTime: baseTime(start, videoClock),
-		Samples:  r.vSamples,
+		BaseTime: baseTime(job.start, videoClock),
+		Samples:  job.v,
 	}}
-	if len(r.aSamples) > 0 && r.audioRate > 0 {
+	if len(job.a) > 0 && job.aRate > 0 {
 		tracks = append(tracks, &fmp4.PartTrack{
 			ID:       2,
-			BaseTime: baseTime(start, r.audioRate),
-			Samples:  r.aSamples,
+			BaseTime: baseTime(job.start, job.aRate),
+			Samples:  job.a,
 		})
 	}
 
-	r.seq++
-	part := &fmp4.Part{SequenceNumber: r.seq, Tracks: tracks}
+	part := &fmp4.Part{SequenceNumber: job.seq, Tracks: tracks}
 	buf := &seekablebuffer.Buffer{}
 	if err := part.Marshal(buf); err != nil {
-		return fmt.Errorf("marshal part: %w", err)
+		r.log.Warn("segment marshal failed", "err", err)
+		return
 	}
 
-	key := storage.SegmentKey(r.camID, start)
-	size := int64(len(buf.Bytes()))
-
+	key := storage.SegmentKey(r.camID, job.start)
+	size := int64(buf.Len())
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	if err := r.backend.Put(ctx, key, bytes.NewReader(buf.Bytes()), size); err != nil {
-		return fmt.Errorf("store %s: %w", key, err)
+		r.log.Warn("segment store failed", "key", key, "err", err)
+		return
 	}
-	if err := r.store.InsertSegment(ctx, r.camID, start, end, key, size); err != nil {
-		// index insert failed after file write → remove orphan
+	if err := r.store.InsertSegment(ctx, r.camID, job.start, job.end, key, size); err != nil {
 		_ = r.backend.Delete(ctx, key)
-		return fmt.Errorf("index %s: %w", key, err)
+		r.log.Warn("segment index failed", "key", key, "err", err)
 	}
-	return nil
 }
 
 // assignDurations sets Duration and PTSOffset on samples from their PTS

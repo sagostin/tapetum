@@ -25,17 +25,22 @@ const maxRingFrames = 120
 const subBuf = 128
 
 type streamState struct {
-	codec string
-	sps   []byte
-	pps   []byte
-	vps   []byte
-	ring  []Frame
-	subs  map[chan Frame]struct{}
+	mu     sync.Mutex
+	codec  string
+	sps    []byte
+	pps    []byte
+	vps    []byte
+	ring   []Frame
+	subs   map[chan Frame]struct{}
+	closed bool // stream torn down; Offer returns early
 }
 
-// Hub fans out frames per (camera, stream) pair.
+// Hub fans out frames per (camera, stream) pair. Streams are sharded — each
+// streamState owns its own mutex so Offer/Subscribe on one camera never block
+// another. The streams map itself uses a sync.RWMutex; Offer/Subscribe use the
+// streamState lock, not the map lock, on the hot path.
 type Hub struct {
-	mu      sync.Mutex
+	mu      sync.RWMutex
 	streams map[streamKey]*streamState
 }
 
@@ -48,18 +53,30 @@ func NewHub() *Hub {
 	return &Hub{streams: map[streamKey]*streamState{}}
 }
 
-// Begin resets the stream state on a new ingest session (codec params may
-// have changed); existing subscribers are kicked so they resubscribe with
-// fresh codec parameters at the next keyframe.
-func (h *Hub) Begin(camID string, sub bool, codec string, sps, pps, vps []byte) {
+func (h *Hub) getOrCreate(k streamKey) *streamState {
+	h.mu.RLock()
+	st, ok := h.streams[k]
+	h.mu.RUnlock()
+	if ok {
+		return st
+	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	k := streamKey{camID, sub}
-	st, ok := h.streams[k]
+	st, ok = h.streams[k]
 	if !ok {
 		st = &streamState{subs: map[chan Frame]struct{}{}}
 		h.streams[k] = st
 	}
+	return st
+}
+
+// Begin resets the stream state on a new ingest session (codec params may
+// have changed); existing subscribers are kicked so they resubscribe with
+// fresh codec parameters at the next keyframe.
+func (h *Hub) Begin(camID string, sub bool, codec string, sps, pps, vps []byte) {
+	st := h.getOrCreate(streamKey{camID, sub})
+	st.mu.Lock()
+	defer st.mu.Unlock()
 	st.codec = codec
 	st.sps, st.pps, st.vps = sps, pps, vps
 	st.ring = nil
@@ -71,10 +88,15 @@ func (h *Hub) Begin(camID string, sub bool, codec string, sps, pps, vps []byte) 
 
 // Offer pushes one access unit to the ring and all subscribers.
 func (h *Hub) Offer(camID string, sub bool, au [][]byte, pts int64) {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	st, ok := h.streams[streamKey{camID, sub}]
-	if !ok {
+	h.mu.RLock()
+	st, exists := h.streams[streamKey{camID, sub}]
+	h.mu.RUnlock()
+	if !exists {
+		return
+	}
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	if st.closed {
 		return
 	}
 	f := Frame{AU: au, PTS: pts, Keyframe: isRandomAccess(st.codec, au)}
@@ -102,10 +124,15 @@ func (h *Hub) Offer(camID string, sub bool, au [][]byte, pts int64) {
 // codec parameter sets are returned for decoder/bootstrap use.
 // ok=false means the stream has no active session.
 func (h *Hub) Subscribe(camID string, sub bool) (codec string, sps, pps, vps []byte, ch <-chan Frame, cancel func(), ok bool) {
-	h.mu.Lock()
-	defer h.mu.Unlock()
+	h.mu.RLock()
 	st, exists := h.streams[streamKey{camID, sub}]
-	if !exists || len(st.ring) == 0 {
+	h.mu.RUnlock()
+	if !exists {
+		return "", nil, nil, nil, nil, func() {}, false
+	}
+	st.mu.Lock()
+	if len(st.ring) == 0 || st.closed {
+		st.mu.Unlock()
 		return "", nil, nil, nil, nil, func() {}, false
 	}
 	c := make(chan Frame, subBuf)
@@ -113,22 +140,48 @@ func (h *Hub) Subscribe(camID string, sub bool) (codec string, sps, pps, vps []b
 		c <- f
 	}
 	st.subs[c] = struct{}{}
+	codec = st.codec
+	sps, pps, vps = st.sps, st.pps, st.vps
+	st.mu.Unlock()
+
 	cancel = func() {
-		h.mu.Lock()
-		defer h.mu.Unlock()
+		st.mu.Lock()
 		delete(st.subs, c)
+		st.mu.Unlock()
 	}
-	return st.codec, st.sps, st.pps, st.vps, c, cancel, true
+	return codec, sps, pps, vps, c, cancel, true
 }
 
 // Codec returns the active codec ("h264"/"h265") for a stream, "" if none.
 func (h *Hub) Codec(camID string, sub bool) string {
+	h.mu.RLock()
+	st, ok := h.streams[streamKey{camID, sub}]
+	h.mu.RUnlock()
+	if !ok {
+		return ""
+	}
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	return st.codec
+}
+
+// remove drops a stream entirely. Called when ingest tears the stream down.
+func (h *Hub) remove(camID string, sub bool) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	if st, ok := h.streams[streamKey{camID, sub}]; ok {
-		return st.codec
+	k := streamKey{camID, sub}
+	st, ok := h.streams[k]
+	if !ok {
+		return
 	}
-	return ""
+	delete(h.streams, k)
+	st.mu.Lock()
+	st.closed = true
+	for ch := range st.subs {
+		delete(st.subs, ch)
+		close(ch)
+	}
+	st.mu.Unlock()
 }
 
 func isRandomAccess(codec string, au [][]byte) bool {

@@ -269,6 +269,22 @@ export interface DiscoveredDevice {
   xaddrs: string[]
 }
 
+export type DiscoverMode = 'multicast' | 'network' | 'host'
+
+export interface DiscoverRequest {
+  /** Default 'multicast'. */
+  mode?: DiscoverMode
+  /** Multicast only: probe window in seconds (1..30). */
+  timeout_s?: number
+  /** Required when mode='network' — IPv4 CIDR, e.g. '192.168.1.0/24'. */
+  network?: string
+  /** Required when mode='host' — IPv4 literal or hostname. */
+  host?: string
+  /** Optional, applies to network/host probes. */
+  username?: string
+  password?: string
+}
+
 export interface DiscoverResponse {
   devices: DiscoveredDevice[]
 }

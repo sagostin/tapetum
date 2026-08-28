@@ -50,7 +50,7 @@ Base path: `/api/v1`. JSON everywhere. Auth via session cookie (UI) or
 | PATCH | `/cameras/{id}` | cameras:write | Update config, retention, motion/AI config |
 | DELETE | `/cameras/{id}` | cameras:write | Delete; `?delete_recordings=true` optional |
 | POST | `/cameras/{id}/enable` `/disable` | cameras:write | Start/stop ingest |
-| POST | `/cameras/discover` | cameras:write | ONVIF WS-Discovery scan → `[{endpoint, name, manufacturer, …}]` |
+| POST | `/cameras/discover` | cameras:write | ONVIF discovery scan → `[{endpoint, name, hardware, …}]`. Supports `mode` = `multicast` (default, WS-Discovery), `network` (scan an IPv4 CIDR), or `host` (probe a single host). See below. |
 | POST | `/cameras/probe` | cameras:write | Test connection `{url|onvif_endpoint, username, password}` → streams, profiles, PTZ caps |
 | POST | `/cameras/{id}/onvif/sync` | cameras:write | Pull profiles/PTZ/imaging caps from device |
 | GET | `/cameras/{id}/snapshot` | live | Live JPEG (from sub-stream keyframe or ffmpeg) |
@@ -68,10 +68,32 @@ Camera create/update body:
   "onvif_endpoint": "http://192.168.1.50/onvif/device_service",
   "record_mode": "continuous",
   "retention_days": 14, "retention_gb": 200, "tier_after_days": 7,
-  "motion_config": {"enabled": true, "sensitivity": 0.6, "zones": [ … ]},
+  "motion_config": {"enabled": true, "sensitivity": 0.6, "zones": [ …]},
   "group_id": null
 }
 ```
+
+Discover body — all fields optional; defaults shown:
+
+```json
+{
+  "mode": "multicast",            // "multicast" | "network" | "host"
+  "timeout_s": 5,                  // multicast only (1..30s)
+  "network": "192.168.1.0/24",     // required when mode="network" (IPv4 CIDR, <= /22)
+  "host": "192.168.1.50",          // required when mode="host" (IPv4 literal or hostname)
+  "username": "admin",             // optional, applies to every probe in network/host modes
+  "password": "…"
+}
+```
+
+`multicast` sends a WS-Discovery probe and returns cameras that announce
+themselves — no credentials. `network` and `host` walk the candidate IPs and
+POST `GetDeviceInformation` to each ONVIF port/path until one answers
+(80 / 8000 / 8080 / 8899 by default, `/onvif/device_service`). Use `network`
+when multicast is blocked by switches/VLANs or when cameras live on a remote
+subnet reachable from the server. The returned `endpoint` is the device's
+advertised device-service XAddr (preferred) or the URL we probed.
+
 
 ## PTZ & Imaging (phase 2)
 

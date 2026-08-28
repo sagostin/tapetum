@@ -49,23 +49,36 @@ func (s *Supervisor) Start(ctx context.Context) error {
 	return nil
 }
 
-// Sync reconciles the engine for a camera after CRUD changes.
+// Sync reconciles the engine for a camera after CRUD changes. Engine teardown
+// is asynchronous so the API handler isn't blocked on the ffmpeg subprocess
+// shutdown path.
 func (s *Supervisor) Sync(ctx context.Context, camID string) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.removeLocked(camID)
+	old := s.removeLocked(camID)
+	s.mu.Unlock()
+	if old != nil {
+		old.Stop()
+	}
+
 	cam, err := s.cams.Get(ctx, camID)
 	if err != nil || !cam.Enabled {
 		return
 	}
-	s.syncOneLocked(cam)
+	s.mu.Lock()
+	if _, taken := s.engines[camID]; !taken {
+		s.syncOneLocked(cam)
+	}
+	s.mu.Unlock()
 }
 
-// Remove stops the engine for a deleted camera.
+// Remove stops the engine for a deleted camera. Teardown is async.
 func (s *Supervisor) Remove(camID string) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.removeLocked(camID)
+	old := s.removeLocked(camID)
+	s.mu.Unlock()
+	if old != nil {
+		old.Stop()
+	}
 }
 
 // Close stops all engines (daemon shutdown).
@@ -107,11 +120,13 @@ func (s *Supervisor) syncOneLocked(c *camera.Camera) {
 	eng.Start()
 }
 
-func (s *Supervisor) removeLocked(camID string) {
-	if e, ok := s.engines[camID]; ok {
-		delete(s.engines, camID)
-		e.Stop()
+func (s *Supervisor) removeLocked(camID string) *Engine {
+	e, ok := s.engines[camID]
+	if !ok {
+		return nil
 	}
+	delete(s.engines, camID)
+	return e
 }
 
 // rawJSON renders the camera's motion_config map back to JSON for parsing.

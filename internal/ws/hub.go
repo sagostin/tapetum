@@ -8,7 +8,7 @@ import (
 	"encoding/json"
 	"log/slog"
 	"net/http"
-	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/coder/websocket"
@@ -27,14 +27,80 @@ type client struct {
 	send   chan []byte
 }
 
-// Hub tracks connected clients and broadcasts messages.
+// Hub tracks connected clients and broadcasts messages. Clients are stored
+// in an atomic.Pointer to a map so Broadcast and ServeHTTP add/remove can run
+// without serializing on a shared mutex; Broadcast copies the map under a
+// pointer swap and then fans out without holding any hub-wide lock.
 type Hub struct {
-	mu      sync.Mutex
-	clients map[*client]struct{}
+	clients        atomic.Pointer[map[*client]struct{}]
+	dev            bool // dev mode allows the Vite WS proxy origin (5173)
+	insecureOrigin bool // InsecureSkipVerify for trusted dev/local setups
 }
 
 func NewHub() *Hub {
-	return &Hub{clients: make(map[*client]struct{})}
+	h := &Hub{}
+	empty := map[*client]struct{}{}
+	h.clients.Store(&empty)
+	return h
+}
+
+// SetDev toggles dev-mode origin handling. When true, the WS accept allows
+// any localhost/127.0.0.1 Origin so the Vite dev server (:5173) can proxy
+// WS upgrades to the backend (:8080) without a same-host mismatch.
+func (h *Hub) SetDev(dev bool) {
+	h.dev = dev
+}
+
+func (h *Hub) snapshot() map[*client]struct{} {
+	return *h.clients.Load()
+}
+
+// acceptOptions builds WebSocket accept options. In dev mode we accept
+// cross-origin WS upgrades from the Vite dev server (typically
+// http://localhost:5173). In production the SPA is same-origin so the
+// Origin must match the Host — that's what coder/websocket enforces when
+// OriginPatterns is empty.
+func (h *Hub) acceptOptions(r *http.Request) *websocket.AcceptOptions {
+	if !h.dev {
+		return &websocket.AcceptOptions{}
+	}
+	return &websocket.AcceptOptions{
+		OriginPatterns: []string{
+			`^https?://(localhost|127\.0\.0\.1)(:\d+)?$`,
+		},
+	}
+}
+
+func (h *Hub) add(c *client) {
+	for {
+		old := h.snapshot()
+		next := make(map[*client]struct{}, len(old)+1)
+		for k := range old {
+			next[k] = struct{}{}
+		}
+		next[c] = struct{}{}
+		if h.clients.CompareAndSwap(&old, &next) {
+			return
+		}
+	}
+}
+
+func (h *Hub) drop(c *client) {
+	for {
+		old := h.snapshot()
+		if _, ok := old[c]; !ok {
+			return
+		}
+		next := make(map[*client]struct{}, len(old)-1)
+		for k := range old {
+			if k != c {
+				next[k] = struct{}{}
+			}
+		}
+		if h.clients.CompareAndSwap(&old, &next) {
+			return
+		}
+	}
 }
 
 // ServeHTTP upgrades the request and runs the client until disconnect.
@@ -46,24 +112,21 @@ func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
-		// SPA is same-origin in prod; dev uses vite proxy (same-origin too).
-		OriginPatterns: []string{},
-	})
+	conn, err := websocket.Accept(w, r, h.acceptOptions(r))
+	if err != nil {
+		slog.Debug("ws accept failed", "err", err)
+		return
+	}
 	if err != nil {
 		slog.Debug("ws accept failed", "err", err)
 		return
 	}
 
 	c := &client{userID: u.ID, conn: conn, send: make(chan []byte, 64)}
-	h.mu.Lock()
-	h.clients[c] = struct{}{}
-	h.mu.Unlock()
+	h.add(c)
 	slog.Debug("ws client connected", "user", u.Username)
 	defer func() {
-		h.mu.Lock()
-		delete(h.clients, c)
-		h.mu.Unlock()
+		h.drop(c)
 		close(c.send)
 		conn.Close(websocket.StatusNormalClosure, "bye")
 	}()
@@ -112,9 +175,7 @@ func (h *Hub) Broadcast(topic string, data any) {
 	if err != nil {
 		return
 	}
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	for c := range h.clients {
+	for c := range h.snapshot() {
 		select {
 		case c.send <- payload:
 		default: // client buffer full — drop
@@ -124,7 +185,5 @@ func (h *Hub) Broadcast(topic string, data any) {
 
 // Count returns connected clients (for /system/stats).
 func (h *Hub) Count() int {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	return len(h.clients)
+	return len(h.snapshot())
 }

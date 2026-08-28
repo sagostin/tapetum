@@ -2,6 +2,7 @@ package api
 
 import (
 	"net/http"
+	"runtime"
 	"time"
 
 	"github.com/sagostin/tapetum/internal/audit"
@@ -13,15 +14,23 @@ import (
 // --- system ---------------------------------------------------------------
 
 func (s *Server) health(w http.ResponseWriter, r *http.Request) {
-	JSON(w, http.StatusOK, map[string]string{"status": "ok"})
+	JSON(w, http.StatusOK, map[string]any{
+		"status":      "ok",
+		"goroutines":  runtime.NumGoroutine(),
+		"uptime_s":    int(time.Since(s.started).Seconds()),
+		"ws_clients":  s.hub.Count(),
+		"ingest_cams": s.ingest.WorkerCount(),
+	})
 }
 
 func (s *Server) info(w http.ResponseWriter, r *http.Request) {
 	JSON(w, http.StatusOK, map[string]any{
-		"version":    s.version,
-		"uptime_s":   int(time.Since(s.started).Seconds()),
-		"ws_clients": s.hub.Count(),
-		"public_url": s.cfg.Server.PublicURL,
+		"version":     s.version,
+		"uptime_s":    int(time.Since(s.started).Seconds()),
+		"ws_clients":  s.hub.Count(),
+		"public_url":  s.cfg.Server.PublicURL,
+		"goroutines":  runtime.NumGoroutine(),
+		"ingest_cams": s.ingest.WorkerCount(),
 	})
 }
 

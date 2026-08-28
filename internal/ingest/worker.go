@@ -44,6 +44,12 @@ type cameraWorker struct {
 	snap    *snapshot
 	log     *slog.Logger
 
+	// decodeLogSampler throttles per-packet decode error logs to one per
+	// (error message, second) per stream — packet reordering and small
+	// losses are normal under UDP/TCP jitter and we don't want them
+	// drowning the log + burning CPU on allocations.
+	decodeLogSampler map[string]time.Time
+
 	ctx    context.Context
 	cancel context.CancelFunc
 
@@ -67,20 +73,33 @@ func newCameraWorker(cam *camera.Camera, cams *camera.Store, segs *record.Store,
 	rec := record.NewRecorder(cam.ID, segs, backend)
 	rec.SetMode(cam.RecordMode)
 	return &cameraWorker{
-		cam:      cam,
-		cams:     cams,
-		segs:     segs,
-		backend:  backend,
-		hub:      hub,
-		live:     liveHub,
-		snap:     snap,
-		log:      log.With("camera", cam.Name, "camera_id", cam.ID),
-		ctx:      ctx,
-		cancel:   cancel,
-		recorder: rec,
-		detail:   map[string]any{},
-		status:   camera.StatusOffline, // zero value "" would violate the DB check
+		cam:              cam,
+		cams:             cams,
+		segs:             segs,
+		backend:          backend,
+		hub:              hub,
+		live:             liveHub,
+		snap:             snap,
+		log:              log.With("camera", cam.Name, "camera_id", cam.ID),
+		ctx:              ctx,
+		cancel:           cancel,
+		recorder:         rec,
+		detail:           map[string]any{},
+		status:           camera.StatusOffline, // zero value "" would violate the DB check
+		decodeLogSampler: map[string]time.Time{},
 	}
+}
+
+// logDecodeErr logs a per-packet decode error at most once per message per
+// second, so a single bad source can't drown the log under thousands of
+// identical "invalid FU-A packet" lines and burn CPU on allocations.
+func (w *cameraWorker) logDecodeErr(msg string) {
+	now := time.Now()
+	if last, ok := w.decodeLogSampler[msg]; ok && now.Sub(last) < time.Second {
+		return
+	}
+	w.decodeLogSampler[msg] = now
+	w.log.Debug(msg)
 }
 
 func (w *cameraWorker) stop() { w.cancel() }
@@ -258,7 +277,7 @@ func (w *cameraWorker) runSession(rawURL string, isSub bool) error {
 			if err != nil {
 				if !errors.Is(err, rtph264.ErrNonStartingPacketAndNoPrevious) &&
 					!errors.Is(err, rtph264.ErrMorePacketsNeeded) {
-					w.log.Debug("h264 decode", "err", err)
+					w.logDecodeErr("h264 decode err=" + err.Error())
 				}
 				return
 			}
@@ -272,7 +291,7 @@ func (w *cameraWorker) runSession(rawURL string, isSub bool) error {
 			if err != nil {
 				if !errors.Is(err, rtph265.ErrNonStartingPacketAndNoPrevious) &&
 					!errors.Is(err, rtph265.ErrMorePacketsNeeded) {
-					w.log.Debug("h265 decode", "err", err)
+					w.logDecodeErr("h265 decode err=" + err.Error())
 				}
 				return
 			}

@@ -17,6 +17,8 @@ import ZoneEditor from './ZoneEditor.vue'
 export interface CameraPrefill {
   name?: string
   onvif_endpoint?: string
+  username?: string
+  password?: string
 }
 
 const props = defineProps<{
@@ -35,8 +37,8 @@ const form = reactive({
   name: props.camera?.name ?? props.prefill?.name ?? '',
   main_url: props.camera?.main_url ?? '',
   sub_url: props.camera?.sub_url ?? '',
-  username: props.camera?.username ?? '',
-  password: '',
+  username: props.camera?.username ?? props.prefill?.username ?? '',
+  password: props.prefill?.password ?? '',
   transport: (props.camera?.transport ?? 'auto') as Transport,
   record_mode: (props.camera?.record_mode ?? 'continuous') as RecordMode,
   retention_days: props.camera?.retention_days ?? 7,

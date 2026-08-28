@@ -64,30 +64,42 @@ func (s *Supervisor) Start(ctx context.Context) error {
 }
 
 // Sync adds, restarts, or removes the worker for a camera after a CRUD
-// change. Safe to call for any camera row state.
+// change. Safe to call for any camera row state. Teardown of the previous
+// worker happens asynchronously so a stuck session loop (up to ~60s of
+// reconnect backoff) cannot stall the API request that triggered the sync.
 func (s *Supervisor) Sync(ctx context.Context, camID string) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	if w, ok := s.workers[camID]; ok {
-		w.stop()
-		delete(s.workers, camID)
-		delete(s.snaps, camID)
+	old := s.workers[camID]
+	delete(s.workers, camID)
+	delete(s.snaps, camID)
+	s.mu.Unlock()
+
+	if old != nil {
+		old.stop()
 	}
+
 	cam, err := s.cams.Get(ctx, camID)
 	if err != nil || !cam.Enabled {
 		return
 	}
-	s.addLocked(cam)
+	s.mu.Lock()
+	if _, taken := s.workers[camID]; !taken {
+		s.addLocked(cam)
+	}
+	s.mu.Unlock()
 }
 
-// Remove stops and drops the worker for a deleted camera.
+// Remove stops and drops the worker for a deleted camera. Teardown is async
+// to keep Remove latency off the API hot path; subsequent calls referencing
+// this camera return "not found" regardless.
 func (s *Supervisor) Remove(camID string) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	if w, ok := s.workers[camID]; ok {
-		w.stop()
-		delete(s.workers, camID)
-		delete(s.snaps, camID)
+	old := s.workers[camID]
+	delete(s.workers, camID)
+	delete(s.snaps, camID)
+	s.mu.Unlock()
+	if old != nil {
+		old.stop()
 	}
 }
 
@@ -129,6 +141,13 @@ func (s *Supervisor) Stats(camID string) map[string]any {
 		return map[string]any{"running": false}
 	}
 	return w.stats()
+}
+
+// WorkerCount returns the number of running camera workers.
+func (s *Supervisor) WorkerCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.workers)
 }
 
 // Snapshot returns the latest decoded JPEG for a camera (sub-stream

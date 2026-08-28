@@ -1,7 +1,14 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import { get, post, del, ApiError } from '../api/client'
-import type { Camera, CameraListResponse, DiscoveredDevice, DiscoverResponse } from '../api/types'
+import type {
+  Camera,
+  CameraListResponse,
+  DiscoveredDevice,
+  DiscoverMode,
+  DiscoverRequest,
+  DiscoverResponse,
+} from '../api/types'
 import { useAuthStore } from '../stores/auth'
 import StatusBadge from '../components/StatusBadge.vue'
 import CameraFormModal from '../components/CameraFormModal.vue'
@@ -30,6 +37,15 @@ const showDiscover = ref(false)
 const discovering = ref(false)
 const discoverError = ref('')
 const devices = ref<DiscoveredDevice[]>([])
+
+// Discover form state. Mode = "multicast" (WS-Discovery, no creds),
+// "network" (scan a CIDR with shared creds) or "host" (single IP/hostname).
+const discoverMode = ref<DiscoverMode>('multicast')
+const discoverTimeout = ref(5)
+const discoverNetwork = ref('')
+const discoverHost = ref('')
+const discoverUsername = ref('')
+const discoverPassword = ref('')
 
 let pollTimer: ReturnType<typeof setInterval> | null = null
 
@@ -64,14 +80,43 @@ async function onSaved() {
   await refresh()
 }
 
-async function discover() {
+function openDiscover() {
   showDiscover.value = true
+  discoverError.value = ''
+  devices.value = []
+  discover()
+}
+
+const discoverDisabled = computed(() => {
+  if (discoverMode.value === 'network') return !discoverNetwork.value.trim()
+  if (discoverMode.value === 'host') return !discoverHost.value.trim()
+  return false
+})
+
+async function discover() {
   discovering.value = true
   discoverError.value = ''
   devices.value = []
+  const body: DiscoverRequest = { mode: discoverMode.value }
+  if (discoverMode.value === 'multicast') {
+    body.timeout_s = discoverTimeout.value
+  } else if (discoverMode.value === 'network') {
+    body.network = discoverNetwork.value.trim()
+  } else if (discoverMode.value === 'host') {
+    body.host = discoverHost.value.trim()
+  }
+  if (discoverMode.value !== 'multicast') {
+    if (discoverUsername.value) body.username = discoverUsername.value
+    if (discoverPassword.value) body.password = discoverPassword.value
+  }
   try {
-    const res = await post<DiscoverResponse>('/cameras/discover', {})
+    const res = await post<DiscoverResponse>('/cameras/discover', body)
     devices.value = res.devices ?? []
+    if (!devices.value.length) {
+      discoverError.value = discoverMode.value === 'multicast'
+        ? 'No ONVIF devices found on the LAN.'
+        : 'No ONVIF devices found at the given host(s).'
+    }
   } catch (err) {
     discoverError.value = err instanceof ApiError ? err.message : 'Discovery failed'
   } finally {
@@ -79,12 +124,26 @@ async function discover() {
   }
 }
 
+// endpoints already adopted in the main camera list — derived from the last
+// refresh so users can see which discovered devices are still pending.
+const adoptedEndpoints = computed(() => {
+  const s = new Set<string>()
+  for (const c of cameras.value) {
+    if (c.onvif_endpoint) s.add(c.onvif_endpoint)
+  }
+  return s
+})
+
 function adopt(dev: DiscoveredDevice) {
-  showDiscover.value = false
+  // keep the discover modal open so the user can adopt more devices from the
+  // same scan without re-running the probe
   editingCamera.value = null
+  const usedCreds = discoverMode.value !== 'multicast'
   formPrefill.value = {
     name: dev.name || dev.hardware || '',
     onvif_endpoint: dev.endpoint,
+    username: usedCreds ? discoverUsername.value : '',
+    password: usedCreds ? discoverPassword.value : '',
   }
   showForm.value = true
 }
@@ -137,7 +196,7 @@ onBeforeUnmount(() => {
     <div class="page-header">
       <h1 class="page-title">Cameras</h1>
       <div v-if="canWrite" class="header-actions">
-        <button class="btn btn-ghost btn-inline" type="button" @click="discover">Discover</button>
+        <button class="btn btn-ghost btn-inline" type="button" @click="openDiscover">Discover</button>
         <button class="btn btn-primary btn-inline" type="button" @click="openAdd">
           Add camera
         </button>
@@ -201,6 +260,145 @@ onBeforeUnmount(() => {
       </table>
     </div>
 
+    <div v-if="showDiscover" class="modal-backdrop" @click.self="showDiscover = false">
+      <div class="modal card discover-modal">
+        <h2 class="modal-title">Discover cameras</h2>
+
+        <div class="mode-tabs" role="tablist">
+          <button
+            v-for="m in (['multicast', 'network', 'host'] as DiscoverMode[])"
+            :key="m"
+            type="button"
+            role="tab"
+            class="mode-tab"
+            :class="{ active: discoverMode === m }"
+            :aria-selected="discoverMode === m"
+            @click="discoverMode = m"
+          >
+            {{
+              m === 'multicast'
+                ? 'Auto-discover'
+                : m === 'network'
+                ? 'Scan network'
+                : 'Single host'
+            }}
+          </button>
+        </div>
+
+        <div v-if="discoverMode === 'multicast'" class="mode-body">
+          <p class="muted hint">
+            Sends a WS-Discovery multicast probe on the local network. No credentials
+            are needed; cameras that don’t advertise ONVIF won’t be found.
+          </p>
+          <label class="field">
+            <span>Timeout (s)</span>
+            <input v-model.number="discoverTimeout" type="number" min="1" max="30" />
+          </label>
+        </div>
+
+        <div v-else-if="discoverMode === 'network'" class="mode-body">
+          <p class="muted hint">
+            Probes every IPv4 address in the CIDR at common ONVIF ports (80, 8000,
+            8080, 8899) using the credentials below. Use this when multicast is
+            blocked or cameras are on another VLAN.
+          </p>
+          <label class="field">
+            <span>Network (CIDR)</span>
+            <input
+              v-model="discoverNetwork"
+              type="text"
+              placeholder="192.168.1.0/24"
+              spellcheck="false"
+            />
+          </label>
+        </div>
+
+        <div v-else class="mode-body">
+          <p class="muted hint">
+            Probes a single host (IP or hostname) at common ONVIF ports using the
+            credentials below.
+          </p>
+          <label class="field">
+            <span>Host</span>
+            <input
+              v-model="discoverHost"
+              type="text"
+              placeholder="192.168.1.50 or camera.lan"
+              spellcheck="false"
+            />
+          </label>
+        </div>
+
+        <div v-if="discoverMode !== 'multicast'" class="field-row">
+          <label class="field">
+            <span>Username</span>
+            <input v-model="discoverUsername" type="text" autocomplete="off" />
+          </label>
+          <label class="field">
+            <span>Password</span>
+            <input v-model="discoverPassword" type="password" autocomplete="new-password" />
+          </label>
+        </div>
+
+        <div class="discover-status">
+          <p v-if="discovering" class="muted">
+            <span class="spinner" aria-hidden="true"></span>
+            {{
+              discoverMode === 'multicast'
+                ? 'Scanning the LAN…'
+                : discoverMode === 'network'
+                ? 'Probing every host on the network…'
+                : 'Probing host…'
+            }}
+          </p>
+          <p v-else-if="discoverError" class="error-text">{{ discoverError }}</p>
+          <p v-else-if="devices.length" class="muted">
+            Found {{ devices.length }} device{{ devices.length === 1 ? '' : 's' }}.
+          </p>
+        </div>
+
+        <div v-if="devices.length" class="device-list">
+          <div
+            v-for="dev in devices"
+            :key="dev.endpoint"
+            class="device-row"
+            :class="{ adopted: adoptedEndpoints.has(dev.endpoint) }"
+          >
+            <div class="device-info">
+              <span class="device-name">
+                {{ dev.name || dev.hardware || 'ONVIF device' }}
+                <span v-if="adoptedEndpoints.has(dev.endpoint)" class="adopted-tag">already added</span>
+              </span>
+              <span v-if="dev.hardware && dev.hardware !== dev.name" class="device-sub">
+                {{ dev.hardware }}
+              </span>
+              <span class="device-sub mono">{{ dev.endpoint }}</span>
+            </div>
+            <button
+              class="btn btn-ghost btn-sm"
+              type="button"
+              :disabled="adoptedEndpoints.has(dev.endpoint)"
+              @click="adopt(dev)"
+            >
+              Adopt
+            </button>
+          </div>
+        </div>
+
+        <div class="modal-actions">
+          <button class="btn btn-ghost" type="button" @click="showDiscover = false">Close</button>
+          <button
+            class="btn btn-primary btn-inline"
+            type="button"
+            :disabled="discovering || discoverDisabled"
+            @click="discover"
+          >
+            {{ discovering ? 'Scanning…' : 'Scan' }}
+          </button>
+        </div>
+      </div>
+    </div>
+
     <CameraFormModal
       v-if="showForm"
       :camera="editingCamera"
@@ -208,31 +406,6 @@ onBeforeUnmount(() => {
       @close="showForm = false"
       @saved="onSaved"
     />
-
-    <div v-if="showDiscover" class="modal-backdrop" @click.self="showDiscover = false">
-      <div class="modal card">
-        <h2 class="modal-title">Discovered ONVIF devices</h2>
-        <p v-if="discovering" class="muted">Scanning the network…</p>
-        <p v-else-if="discoverError" class="error-text">{{ discoverError }}</p>
-        <p v-else-if="!devices.length" class="muted">No ONVIF devices found.</p>
-        <div v-else class="device-list">
-          <div v-for="dev in devices" :key="dev.endpoint" class="device-row">
-            <div class="device-info">
-              <span class="device-name">{{ dev.name || dev.hardware || 'ONVIF device' }}</span>
-              <span v-if="dev.hardware && dev.hardware !== dev.name" class="device-sub">{{ dev.hardware }}</span>
-              <span class="device-sub mono">{{ dev.endpoint }}</span>
-            </div>
-            <button class="btn btn-ghost btn-sm" type="button" @click="adopt(dev)">Adopt</button>
-          </div>
-        </div>
-        <div class="modal-actions">
-          <button class="btn btn-ghost" type="button" @click="showDiscover = false">Close</button>
-          <button class="btn btn-ghost" type="button" :disabled="discovering" @click="discover">
-            {{ discovering ? 'Scanning…' : 'Scan again' }}
-          </button>
-        </div>
-      </div>
-    </div>
 
     <div v-if="deletingCamera" class="modal-backdrop" @click.self="deletingCamera = null">
       <div class="modal card">
@@ -296,6 +469,24 @@ onBeforeUnmount(() => {
   border: 1px solid var(--border);
   border-radius: 8px;
   background: var(--bg-elevated);
+}
+
+.device-row.adopted {
+  opacity: 0.65;
+}
+
+.adopted-tag {
+  margin-left: 0.5rem;
+  padding: 0.05rem 0.4rem;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  font-size: 0.7rem;
+  font-weight: 500;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  vertical-align: 1px;
 }
 
 .device-info {
@@ -446,6 +637,94 @@ onBeforeUnmount(() => {
   max-width: 440px;
 }
 
+.discover-modal {
+  max-width: 520px;
+}
+
+.mode-tabs {
+  display: flex;
+  gap: 0.25rem;
+  margin-bottom: 0.9rem;
+  border-bottom: 1px solid var(--border);
+}
+
+.mode-tab {
+  flex: 1;
+  padding: 0.5rem 0.6rem;
+  background: transparent;
+  border: none;
+  border-bottom: 2px solid transparent;
+  color: var(--text-muted);
+  font-size: 0.88rem;
+  font-family: inherit;
+  cursor: pointer;
+  transition: color 0.15s ease, border-color 0.15s ease;
+}
+
+.mode-tab:hover {
+  color: var(--text);
+}
+
+.mode-tab.active {
+  color: var(--accent);
+  border-bottom-color: var(--accent);
+}
+
+.mode-body {
+  margin-bottom: 0.9rem;
+}
+
+.mode-body .hint {
+  font-size: 0.82rem;
+  margin: 0 0 0.7rem;
+  line-height: 1.4;
+}
+
+.discover-modal .field-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0.7rem;
+  margin-bottom: 0.9rem;
+}
+
+.discover-modal .field {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  margin-bottom: 0.7rem;
+}
+
+.discover-modal .field span {
+  font-size: 0.82rem;
+  color: var(--text-muted);
+}
+
+.discover-modal input[type='text'],
+.discover-modal input[type='number'],
+.discover-modal input[type='password'] {
+  width: 100%;
+  padding: 0.5rem 0.7rem;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text);
+  font-size: 0.92rem;
+  font-family: inherit;
+  outline: none;
+}
+
+.discover-modal input:focus {
+  border-color: var(--accent);
+}
+
+.discover-status {
+  min-height: 1.6rem;
+  margin: 0.3rem 0 0.6rem;
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
 .modal-title {
   margin: 0 0 0.75rem;
   font-size: 1.15rem;
@@ -476,5 +755,23 @@ onBeforeUnmount(() => {
 
 .btn-danger-solid:hover:not(:disabled) {
   filter: brightness(1.1);
+}
+
+.spinner {
+  display: inline-block;
+  width: 12px;
+  height: 12px;
+  border: 2px solid var(--border);
+  border-top-color: var(--text);
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+  vertical-align: -2px;
+  margin-right: 0.3rem;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
 }
 </style>

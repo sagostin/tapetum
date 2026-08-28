@@ -6,8 +6,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	onvifgo "github.com/0x524a/onvif-go"
@@ -45,6 +47,252 @@ func Discover(ctx context.Context, timeout time.Duration) ([]*DiscoveredDevice, 
 		out = append(out, dd)
 	}
 	return out, nil
+}
+
+// Default ONVIF ports and paths to probe when a device is reachable on a
+// known host (or a network range) but did not respond to WS-Discovery
+// multicast. Manufacturers vary: Hikvision commonly uses 80, Dahua 80, Reolink
+// 80/8000, some legacy devices 8080/8899.
+var (
+	defaultONVIFPorts   = []int{80, 8000, 8080, 8899}
+	defaultONVIFPaths   = []string{"/onvif/device_service"}
+	maxScanHostsPerCIDR = 1024 // refuse /8 scans; keep scan time bounded
+)
+
+// CIDRHosts expands an IPv4 CIDR (e.g. "192.168.1.0/24") into the list of host
+// IPs in the range, skipping the network and broadcast addresses. Returns an
+// error for IPv6 or malformed input. Larger ranges than maxScanHostsPerCIDR are
+// rejected so the scan cannot block for arbitrarily long.
+func CIDRHosts(cidr string) ([]string, error) {
+	ip, ipNet, err := net.ParseCIDR(cidr)
+	if err != nil {
+		return nil, fmt.Errorf("onvif: invalid CIDR %q: %w", cidr, err)
+	}
+	if ip.To4() == nil {
+		return nil, fmt.Errorf("onvif: only IPv4 CIDRs are supported")
+	}
+	ones, bits := ipNet.Mask.Size()
+	if bits != 32 {
+		return nil, fmt.Errorf("onvif: only IPv4 CIDRs are supported")
+	}
+	if 32-ones < 1 {
+		return []string{ip.String()}, nil // /32 is a single host
+	}
+	// walk every address in the CIDR; we'll skip network and broadcast below.
+	cur := ip.Mask(ipNet.Mask)
+	end := make(net.IP, len(cur))
+	copy(end, cur)
+	// set host bits to all 1s
+	for i := range end {
+		end[i] |= ^ipNet.Mask[i]
+	}
+	hosts := []string{}
+	for {
+		hosts = append(hosts, cur.String())
+		if cur.Equal(end) {
+			break
+		}
+		incIP(cur)
+	}
+	if 32-ones >= 2 {
+		// strip network and broadcast for prefixes wider than /31
+		hosts = hosts[1 : len(hosts)-1]
+	}
+	if len(hosts) > maxScanHostsPerCIDR {
+		return nil, fmt.Errorf("onvif: CIDR too large (%d hosts); narrow to <= %d hosts",
+			len(hosts), maxScanHostsPerCIDR)
+	}
+	return hosts, nil
+}
+
+func incIP(ip net.IP) {
+	for i := len(ip) - 1; i >= 0; i-- {
+		ip[i]++
+		if ip[i] != 0 {
+			return
+		}
+	}
+}
+
+// ResolveHost expands a single hostname or IP literal into one or more IP
+// literals to probe. Hostnames are resolved via DNS so the scan hits every
+// address a multi-homed host exposes.
+func ResolveHost(host string) ([]string, error) {
+	if ip := net.ParseIP(host); ip != nil {
+		if ip.To4() == nil {
+			return nil, fmt.Errorf("onvif: only IPv4 hosts are supported")
+		}
+		return []string{ip.String()}, nil
+	}
+	addrs, err := net.LookupHost(host)
+	if err != nil {
+		return nil, fmt.Errorf("onvif: resolve %q: %w", host, err)
+	}
+	out := make([]string, 0, len(addrs))
+	for _, a := range addrs {
+		ip := net.ParseIP(a)
+		if ip == nil || ip.To4() == nil {
+			continue
+		}
+		out = append(out, ip.String())
+	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("onvif: no IPv4 addresses for %q", host)
+	}
+	return out, nil
+}
+
+// ScanOptions tunes a directed-scan discovery.
+type ScanOptions struct {
+	// PerProbeTimeout caps the time spent on a single (host, port, path) probe.
+	// Defaults to 2s if zero.
+	PerProbeTimeout time.Duration
+	// Parallelism is the max in-flight probes. Defaults to 32 if zero.
+	Parallelism int
+	// Ports overrides the TCP port set (default: common ONVIF ports).
+	Ports []int
+	// Paths overrides the URL path set (default: /onvif/device_service).
+	Paths []string
+}
+
+// ScanHosts probes the given IP list against common ONVIF device-service
+// ports/paths and returns the discovered devices. Each (host, port, path)
+// triple is tried in parallel; the first successful response on a host marks
+// that host as a device and we stop probing additional ports/paths for it.
+//
+// Credentials, when non-empty, are sent with every probe — use this when the
+// fleet shares a username/password (most common case for ONVIF). Empty
+// credentials attempt unauthenticated access (which some devices allow).
+func ScanHosts(ctx context.Context, hosts []string, username, password string, opts ScanOptions) ([]*DiscoveredDevice, error) {
+	if opts.PerProbeTimeout <= 0 {
+		opts.PerProbeTimeout = 2 * time.Second
+	}
+	if opts.Parallelism <= 0 {
+		opts.Parallelism = 32
+	}
+	if len(opts.Ports) == 0 {
+		opts.Ports = defaultONVIFPorts
+	}
+	if len(opts.Paths) == 0 {
+		opts.Paths = defaultONVIFPaths
+	}
+
+	// Build every (host, port, path) candidate. The probe fan-out is bounded
+	// by opts.Parallelism; once a host yields a device we still drain the
+	// candidates that mention the same host so we don't leak goroutines.
+	type candidate struct {
+		host, path string
+		port       int
+	}
+	cands := make([]candidate, 0, len(hosts)*len(opts.Ports)*len(opts.Paths))
+	for _, h := range hosts {
+		for _, p := range opts.Ports {
+			for _, pa := range opts.Paths {
+				cands = append(cands, candidate{host: h, port: p, path: pa})
+			}
+		}
+	}
+
+	// Per-host "found" channel so once one candidate succeeds for a host, the
+	// remaining candidates for that host stop being processed (they'd just be
+	// duplicates anyway).
+	knownHosts := make(map[string]bool, len(hosts))
+	for _, h := range hosts {
+		knownHosts[h] = false
+	}
+
+	var (
+		mu      sync.Mutex
+		devices []*DiscoveredDevice
+		wg      sync.WaitGroup
+		sem     = make(chan struct{}, opts.Parallelism)
+	)
+	for _, c := range cands {
+		select {
+		case <-ctx.Done():
+			wg.Wait()
+			if devices == nil {
+				devices = []*DiscoveredDevice{}
+			}
+			return devices, ctx.Err()
+		default:
+		}
+		mu.Lock()
+		if knownHosts[c.host] {
+			mu.Unlock()
+			continue
+		}
+		mu.Unlock()
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(c candidate) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			probeCtx, cancel := context.WithTimeout(ctx, opts.PerProbeTimeout)
+			defer cancel()
+			dev, err := ProbeAt(probeCtx, c.host, c.port, c.path, username, password)
+			if err != nil || dev == nil {
+				return
+			}
+			mu.Lock()
+			if !knownHosts[c.host] {
+				knownHosts[c.host] = true
+				devices = append(devices, dev)
+			}
+			mu.Unlock()
+		}(c)
+	}
+	wg.Wait()
+	if devices == nil {
+		devices = []*DiscoveredDevice{}
+	}
+	return devices, nil
+}
+
+// ProbeAt attempts to reach an ONVIF device service at the given
+// (host, port, path) candidate with the supplied credentials. Returns a
+// DiscoveredDevice when GetDeviceInformation succeeds, or an error otherwise.
+// The endpoint URL is normalised to http://host:port/path and exposed in
+// DiscoveredDevice.Endpoint for adoption.
+func ProbeAt(ctx context.Context, host string, port int, path, username, password string) (*DiscoveredDevice, error) {
+	if !strings.HasPrefix(path, "/") {
+		path = "/" + path
+	}
+	endpoint := fmt.Sprintf("http://%s:%d%s", host, port, path)
+	c, err := NewClient(endpoint, username, password)
+	if err != nil {
+		return nil, err
+	}
+	info, err := c.GetDeviceInformation(ctx)
+	if err != nil {
+		return nil, err
+	}
+	dev := &DiscoveredDevice{
+		Endpoint: endpoint,
+		Name:     info.Manufacturer + " " + info.Model,
+		Hardware: info.Model,
+		Location: info.SerialNumber,
+	}
+	if info.FirmwareVersion != "" {
+		dev.Location = strings.TrimSpace(dev.Location + " fw=" + info.FirmwareVersion)
+	}
+	// Prefer the device service XAddr advertised by GetCapabilities if present.
+	if caps, err := c.GetCapabilities(ctx); err == nil {
+		if caps.Device != nil && caps.Device.XAddr != "" {
+			dev.Endpoint = caps.Device.XAddr
+			dev.XAddrs = append(dev.XAddrs, caps.Device.XAddr)
+		}
+		if caps.PTZ != nil && caps.PTZ.XAddr != "" {
+			dev.XAddrs = append(dev.XAddrs, caps.PTZ.XAddr)
+		}
+		if caps.Media != nil && caps.Media.XAddr != "" {
+			dev.XAddrs = append(dev.XAddrs, caps.Media.XAddr)
+		}
+		if caps.Imaging != nil && caps.Imaging.XAddr != "" {
+			dev.XAddrs = append(dev.XAddrs, caps.Imaging.XAddr)
+		}
+	}
+	return dev, nil
 }
 
 // NewClient builds an authenticated ONVIF client for an endpoint.
