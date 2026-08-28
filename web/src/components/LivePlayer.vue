@@ -68,7 +68,6 @@ let mseAppending = false
 let destroyed = false
 let observer: IntersectionObserver | null = null
 let visible = false
-let pendingStart = false
 
 function setMode(m: Mode) {
   if (mode.value === m) return
@@ -295,11 +294,14 @@ function stopHls() {
 
 function start() {
   if (!visible) {
-    pendingStart = true
     return
   }
-  stopFmp4()
-  stopHls()
+  // Idempotent: if start() is called while a previous run is still in
+  // flight, just let it finish — tearing down and re-creating the MSE
+  // source on every observer tick causes flicker.
+  if (mse || hls) {
+    return
+  }
   // Prefer the Protect-style fMP4 path; fall through to HLS on error.
   setMode('fmp4')
   requestAnimationFrame(() => {
@@ -322,10 +324,7 @@ onMounted(() => {
         for (const entry of entries) {
           visible = entry.isIntersecting
           if (visible) {
-            if (pendingStart || mode.value === 'mjpeg') {
-              pendingStart = false
-              start()
-            }
+            start()
           } else {
             stop()
             if (mode.value === 'mjpeg') setMode('fmp4')
@@ -337,8 +336,12 @@ onMounted(() => {
     observer.observe(rootEl.value)
   } else {
     visible = true
-    start()
   }
+  // Always start on mount regardless of observer state — the observer only
+  // gates scroll-away. Without this, tiles that mount while visible would
+  // never bootstrap because mode is already 'fmp4' and the elses branch
+  // only restarts from 'mjpeg'.
+  start()
 })
 
 watch(
