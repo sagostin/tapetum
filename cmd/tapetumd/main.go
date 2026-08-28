@@ -28,7 +28,6 @@ import (
 	"github.com/sagostin/tapetum/internal/settings"
 	"github.com/sagostin/tapetum/internal/storage"
 	"github.com/sagostin/tapetum/internal/transcode"
-	"github.com/sagostin/tapetum/internal/webrtc"
 	"github.com/sagostin/tapetum/internal/ws"
 )
 
@@ -122,8 +121,6 @@ func main() {
 		slog.Error("transcode init failed", "err", err)
 		os.Exit(1)
 	}
-	rtc := webrtc.NewServer(liveHub)
-	defer rtc.Close()
 
 	if err := ing.Start(ctx); err != nil {
 		slog.Error("ingest start failed", "err", err)
@@ -148,7 +145,7 @@ func main() {
 	go partitionTicker(ctx, evStore)
 
 	srv := api.NewServer(cfg, pool, hub, version, cams, segs, backend, resolve,
-		s3m, st, ing, exp, rtc, tc, evStore, notifyStore, notifyWorker)
+		s3m, st, ing, exp, tc, evStore, notifyStore, notifyWorker)
 	srv.OnCameraChange = func(ctx context.Context, camID string, deleted bool) {
 		if deleted {
 			detectSup.Remove(camID)

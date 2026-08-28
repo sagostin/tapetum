@@ -20,7 +20,6 @@ import (
 	"github.com/sagostin/tapetum/internal/settings"
 	"github.com/sagostin/tapetum/internal/storage"
 	"github.com/sagostin/tapetum/internal/transcode"
-	"github.com/sagostin/tapetum/internal/webrtc"
 	"github.com/sagostin/tapetum/internal/ws"
 )
 
@@ -39,7 +38,6 @@ type Server struct {
 	settings     *settings.Store
 	ingest       *ingest.Supervisor
 	exporter     *export.Worker
-	webrtc       *webrtc.Server
 	transcode    *transcode.Service
 	evStore      *events.Store
 	notifyStore  *notify.Store
@@ -55,7 +53,7 @@ type Server struct {
 func NewServer(cfg *config.Config, pool *pgxpool.Pool, hub *ws.Hub, version string,
 	cams *camera.Store, segs *record.Store, backend storage.Backend,
 	resolve storage.Resolver, s3m *storage.S3Manager, st *settings.Store,
-	ing *ingest.Supervisor, exp *export.Worker, rtc *webrtc.Server, tc *transcode.Service,
+	ing *ingest.Supervisor, exp *export.Worker, tc *transcode.Service,
 	evStore *events.Store, notifyStore *notify.Store, notifyWorker *notify.Worker,
 ) *Server {
 	return &Server{
@@ -72,7 +70,6 @@ func NewServer(cfg *config.Config, pool *pgxpool.Pool, hub *ws.Hub, version stri
 		settings:     st,
 		ingest:       ing,
 		exporter:     exp,
-		webrtc:       rtc,
 		transcode:    tc,
 		evStore:      evStore,
 		notifyStore:  notifyStore,
@@ -163,8 +160,8 @@ func (s *Server) Router() http.Handler {
 		r.With(s.require(auth.PermPTZ)).Get("/cameras/{id}/imaging", s.imagingGet)
 		r.With(s.require(auth.PermPTZ)).Put("/cameras/{id}/imaging", s.imagingPut)
 
-		// Live streaming.
-		r.With(s.require(auth.PermLive)).Post("/streams/{cameraId}/webrtc", s.webrtcOffer)
+		// Live streaming — HLS only (docs/03-api.md). MJPEG is the in-band
+		// fallback when the recorder hasn't produced a segment yet.
 		r.With(s.require(auth.PermLive)).Get("/streams/{cameraId}/mjpeg", s.mjpeg)
 		r.With(s.require(auth.PermLive)).Get("/streams/{cameraId}/live.m3u8", s.livePlaylist)
 

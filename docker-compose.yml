@@ -23,6 +23,8 @@ services:
   app:
     build: .
     restart: unless-stopped
+    # Bridge networking is fine — live playback is plain HLS over HTTP (no
+    # ICE, no peer connections, no UDP), so we don't need host networking.
     ports:
       - "${APP_PORT:-8080}:8080"
       - "${PPROF_BIND:-127.0.0.1:6060}:6060" # pprof; only serves if TAPETUM_PPROF_ADDR is set

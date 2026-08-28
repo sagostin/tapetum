@@ -9,7 +9,7 @@
 | State | Pinia |
 | Router | Vue Router (auth guards, role-based route gating) |
 | Playback | hls.js (+ native HLS on Safari), bare `<video>` (no native controls) |
-| Live | native `RTCPeerConnection` (WebRTC), `<img>` MJPEG fallback |
+| Live | hls.js (`MediaSource` / MSE) over `/streams/{cam}/live.m3u8`, `<img>` MJPEG fallback |
 | Timeline | shared `ZoomableTimeline.vue` (DOM-based, no chart lib) |
 | Player zoom/pan | CSS `transform: translate() scale()` composable (`useZoomPan`) |
 | HTTP | fetch wrapper w/ CSRF header injection + 401→login redirect |
@@ -30,8 +30,8 @@ web/
 │   ├── api/                 # typed client per domain (auth.ts, cameras.ts, …)
 │   ├── composables/         # reusable Vue composables (useZoomPan, …)
 │   ├── components/
-│   │   ├── CameraTile.vue       # grid cell: WebRTC/MJPEG + status overlay
-│   │   ├── LivePlayer.vue       # WebRTC primary, MJPEG fallback
+│   │   ├── CameraTile.vue       # grid cell: HLS + status overlay
+│   │   ├── LivePlayer.vue       # hls.js primary, MJPEG fallback
 │   │   ├── VideoPlayer.vue      # UI3-style player: bare video + CSS-zoom + custom controls
 │   │   ├── ZoomableTimeline.vue # wheel-zoom, drag-pan, click-seek, event pips
 │   │   ├── PtzPad.vue           # directional pad + zoom slider + presets
@@ -75,7 +75,7 @@ client-side (UX only — server enforces for real).
 ### Dashboard (live grid)
 
 - Auto layout: 1/4/6/9/12 tiles; drag to reorder, per-user layout persisted.
-- Each tile: WebRTC sub-stream; falls back to MJPEG after 2 failed attempts;
+- Each tile: hls.js over the camera's live m3u8; falls back to MJPEG if HLS errors.
   shows status badge (● online / ▲ degraded / ○ offline), name, clock.
 - Click → CameraView. Live event toasts via WS.
 

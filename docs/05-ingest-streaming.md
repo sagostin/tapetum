@@ -58,25 +58,25 @@ Each enabled camera gets a supervised worker pair (main + optional sub stream):
 
 - `POST /streams/{cam}/webrtc` with SDP offer → answer; trickle ICE over same
   route. No STUN needed on LAN; TURN optional config for remote access.
-- Source: in-process ring buffer of the requested stream (default sub for
-  grid, main for single view). H.264 passthrough — no transcode when the
-  camera sends H.264.
-- Max peers per camera (default 4) → overflow clients fall back.
-- H.265-only cameras: transcode to H.264 via ffmpeg on demand (flagged
-  per-camera; off by default, CPU warning in UI).
+- Source: HLS over plain HTTP — the browser fetches `/streams/{cam}/live.m3u8`
+   and consumes the recorder's most recent fMP4 segments via hls.js. No ICE,
+   no peer connections, no UDP, no STUN/TURN — works behind any proxy /
+   NAT / LAN. H.265 cameras are transparently transcoded to H.264 via the
+   `?transcode=h264` query param (see `docs/03-api.md`).
+ - Max peers per camera (default 4) → overflow clients fall back.
+ - H.265-only cameras: transcode to H.264 via ffmpeg on demand (flagged
+   per-camera; off by default, CPU warning in UI).
 
 ### Fallbacks
 
 - **MJPEG** (`/streams/{cam}/mjpeg`): JPEG frames at ~1fps from the snapshot
   cache (sub-stream preferred, scaled to ≤960px, singleflight + a global
   ffmpeg decode cap of 2 — MJPEG can never peg the CPU). Works everywhere,
-  useful for embedding.
-- **WebRTC sub→main fallback**: a `stream=sub` offer for a camera with no
-  sub stream session is served from the main stream when it's H.264, instead
-  of pushing the client onto MJPEG.
+  useful for embedding. Auto-used by the dashboard tile when HLS fails to
+  start.
 - **Near-live HLS** (`/streams/{cam}/live.m3u8`): playlist over the most
   recent N recorded segments. ~6–12s behind real time; zero extra work since
-  recorder already produces the chunks.
+  the recorder already produces the chunks.
 
 ## Playback — On-Demand HLS (fast scrubbing)
 

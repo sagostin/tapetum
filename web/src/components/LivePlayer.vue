@@ -1,15 +1,22 @@
 <script setup lang="ts">
+/**
+ * UI3 live player.
+ *
+ * Streams a camera's recent fMP4 recordings as HLS via hls.js
+ * (`GET /api/v1/streams/{cam}/live.m3u8`) — same plain HTTP, no ICE, no UDP,
+ * no peer connections. Falls back to MJPEG (`<img>` multipart) if HLS fails
+ * to start. The audio track isn't streamed live; audio is recorded-only.
+ */
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
-import { post } from '../api/client'
-import { startWebRTC } from '../lib/webrtc'
-import { acquireWebRTCSlot, releaseWebRTCSlot } from '../lib/webrtc-slot'
-import type { DisplayRotate } from '../api/types'
+import Hls, { type ErrorData } from 'hls.js'
 
 type Fit = 'contain' | 'cover'
 
 const props = withDefaults(
   defineProps<{
     cameraId: string
+    /** Ignored for live HLS — the server only records the main stream. Kept
+     *  for API compatibility with the previous player. */
     stream?: 'sub' | 'main'
     muted?: boolean
     /** When true, the "Live" badge and MJPEG-fallback tag are hidden. */
@@ -17,7 +24,7 @@ const props = withDefaults(
     /** object-fit mode — 'contain' = UI3 Fit, 'cover' = UI3 Fill. */
     fit?: Fit
     /** Rotation in degrees — only multiples of 90 are honored. */
-    rotate?: DisplayRotate
+    rotate?: number
     /** Mirror the video horizontally. */
     hflip?: boolean
     /** Mirror the video vertically. */
@@ -35,94 +42,130 @@ const props = withDefaults(
 )
 
 const emit = defineEmits<{
-  (e: 'mode', mode: 'webrtc' | 'mjpeg'): void
+  (e: 'mode', mode: 'hls' | 'mjpeg'): void
 }>()
 
-const mode = ref<'webrtc' | 'mjpeg'>('webrtc')
+const mode = ref<'hls' | 'mjpeg'>('hls')
 const videoEl = ref<HTMLVideoElement | null>(null)
 const rootEl = ref<HTMLDivElement | null>(null)
 
-let cleanup: (() => void) | null = null
-let inFlight = false
-let visible = false
+let hls: Hls | null = null
 let destroyed = false
 let observer: IntersectionObserver | null = null
+let visible = false
 let pendingStart = false
 
-const mjpegUrl = () => `/api/v1/streams/${props.cameraId}/mjpeg`
-
-function setMode(m: 'webrtc' | 'mjpeg') {
+function setMode(m: 'hls' | 'mjpeg') {
   if (mode.value === m) return
   mode.value = m
   emit('mode', m)
 }
 
-async function start() {
-  // Don't even attempt WebRTC for off-screen tiles — saves a full RTCPeerConnection
-  // setup (~2s of ICE gathering on the main thread) per hidden tile and stops the
-  // dashboard from locking up on first paint with many cameras.
+function mjpegUrl() {
+  return `/api/v1/streams/${props.cameraId}/mjpeg`
+}
+
+function hlsUrl() {
+  // ?transcode=h264 — server transcodes H.265 main segments on demand.
+  return `/api/v1/streams/${props.cameraId}/live.m3u8?transcode=h264`
+}
+
+function destroy() {
+  if (hls) {
+    hls.destroy()
+    hls = null
+  }
+}
+
+function startHls() {
+  const video = videoEl.value
+  if (!video) return
+  destroy()
+
+  if (Hls.isSupported()) {
+    const instance = new Hls({
+      liveSyncDurationCount: 3,
+      backBufferLength: 120,
+      manifestLoadingMaxRetry: 3,
+      levelLoadingMaxRetry: 3,
+      fragLoadingMaxRetry: 3,
+      // Avoid hls.js trying to recover forever on a misconfigured stream
+      // — give up and let the tile fall back to MJPEG.
+      fragLoadingMaxRetryTimeout: 8000,
+    })
+    hls = instance
+    instance.on(Hls.Events.MANIFEST_PARSED, () => {
+      video.play().catch(() => {
+        // Autoplay blocked — user gesture can resume.
+      })
+    })
+    instance.on(Hls.Events.ERROR, (_event: typeof Hls.Events.ERROR, data: ErrorData) => {
+      if (!data.fatal) return
+      destroy()
+      if (!destroyed) setMode('mjpeg')
+    })
+    instance.loadSource(hlsUrl())
+    instance.attachMedia(video)
+  } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+    video.src = hlsUrl()
+    video.addEventListener(
+      'loadedmetadata',
+      () => {
+        video.play().catch(() => {})
+      },
+      { once: true },
+    )
+    video.addEventListener(
+      'error',
+      () => {
+        if (!destroyed) setMode('mjpeg')
+      },
+      { once: true },
+    )
+  } else {
+    setMode('mjpeg')
+  }
+}
+
+function stopHls() {
+  destroy()
+  if (videoEl.value) {
+    videoEl.value.removeAttribute('src')
+    videoEl.value.load()
+  }
+}
+
+function start() {
   if (!visible) {
     pendingStart = true
     return
   }
-  if (inFlight) return
-  stop()
-  const video = videoEl.value
-  if (!video) return
-  inFlight = true
-  await acquireWebRTCSlot()
-  try {
-    // Navigated away / scrolled off while queued for a slot — don't set up
-    // a connection nobody is looking at.
+  setMode('hls')
+  // Wait a tick so the video element is actually in the DOM (v-show toggles).
+  requestAnimationFrame(() => {
     if (destroyed || !visible) return
-    const c = await startWebRTC(
-      video,
-      props.cameraId,
-      props.stream,
-      { post: (path, body) => post(path, body) },
-      () => setMode('mjpeg'),
-    )
-    // Unmounted or hidden while setup was in flight — close the connection
-    // immediately instead of leaking a stream that keeps downloading.
-    if (destroyed || !visible) {
-      c()
-      return
-    }
-    cleanup = c
-  } finally {
-    inFlight = false
-    releaseWebRTCSlot()
-  }
+    startHls()
+  })
 }
 
 function stop() {
-  if (cleanup) {
-    cleanup()
-    cleanup = null
-  }
+  stopHls()
 }
 
 onMounted(() => {
-  // Observe visibility on the wrapper (the <video> itself is hidden until webrtc
-  // mode wins, so its bounding box is 0×0 and the observer would never fire).
   if (rootEl.value && typeof IntersectionObserver !== 'undefined') {
     observer = new IntersectionObserver(
       (entries) => {
         for (const entry of entries) {
           visible = entry.isIntersecting
           if (visible) {
-            if (pendingStart || !cleanup) {
+            if (pendingStart || mode.value === 'mjpeg') {
               pendingStart = false
               start()
             }
           } else {
-            // Free the slot + connection immediately when scrolled away.
             stop()
-            // MJPEG mode: stop() can't close the <img>'s multipart stream —
-            // flipping back to webrtc removes the img from the DOM, which
-            // does. On scroll-in, WebRTC is retried (and re-falls-back if
-            // still unavailable).
-            if (mode.value === 'mjpeg') setMode('webrtc')
+            if (mode.value === 'mjpeg') setMode('hls')
           }
         }
       },
@@ -130,7 +173,6 @@ onMounted(() => {
     )
     observer.observe(rootEl.value)
   } else {
-    // Fallback: assume visible so non-IntersectionObserver browsers still work.
     visible = true
     start()
   }
@@ -139,25 +181,16 @@ onMounted(() => {
 watch(
   () => [props.cameraId, props.stream],
   () => {
-    mode.value = 'webrtc'
     start()
   },
 )
 
-// Compute the CSS transform that orients the media element. Rotate first,
-// then flip on the rotated frame (so a 90° + hflip mirrors vertically,
-// matching UI3's expectations).
 const mediaTransform = computed(() => {
-  const r = props.rotate || 0
   const sx = props.hflip ? -1 : 1
   const sy = props.vflip ? -1 : 1
-  if (r === 0) {
-    return sx === 1 && sy === 1 ? 'none' : `scale(${sx}, ${sy})`
-  }
-  return `rotate(${r}deg) scale(${sx}, ${sy})`
+  if (props.rotate === 0) return sx === 1 && sy === 1 ? 'none' : `scale(${sx}, ${sy})`
+  return `rotate(${props.rotate}deg) scale(${sx}, ${sy})`
 })
-
-// Rotate 90 / 270 swap the tile aspect ratio; the wrapper applies this.
 const isRotated = computed(() => props.rotate === 90 || props.rotate === 270)
 
 onBeforeUnmount(() => {
@@ -176,7 +209,7 @@ defineExpose({ mode })
   <div ref="rootEl" class="live-player" :class="{ 'live-rotated': isRotated }">
     <div class="live-frame">
       <video
-        v-show="mode === 'webrtc'"
+        v-show="mode === 'hls'"
         ref="videoEl"
         class="live-media"
         :class="`live-fit-${fit}`"
@@ -211,8 +244,6 @@ defineExpose({ mode })
   overflow: hidden;
 }
 
-/* live-frame hosts the media so the rotation transform sits on a 100%
-   sized box while the player still flexes to whatever the parent wants. */
 .live-frame {
   position: absolute;
   inset: 0;
@@ -239,9 +270,6 @@ defineExpose({ mode })
   object-fit: cover;
 }
 
-/* When the media is rotated 90/270, the source is square-tile-shaped in its
-   own coordinate system but rotated to portrait. Constrain its visible
-   bounds so it stays centered and clips symmetrically. */
 .live-player.live-rotated .live-media {
   width: 100%;
   height: 100%;
