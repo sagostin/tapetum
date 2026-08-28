@@ -25,6 +25,9 @@ RUN CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -X main.version=${VERSION}"
 FROM alpine:3.21
 RUN apk add --no-cache ca-certificates tzdata ffmpeg
 RUN adduser -D -u 1000 tapetum
+# /data must be writable by the app user; named volumes inherit ownership
+# from the image directory on first mount.
+RUN mkdir -p /data && chown tapetum:tapetum /data
 COPY --from=build /tapetumd /usr/local/bin/tapetumd
 USER tapetum
 VOLUME /data
