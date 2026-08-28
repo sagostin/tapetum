@@ -33,12 +33,6 @@ services:
       TAPETUM_DATABASE_URL: ${TAPETUM_DATABASE_URL:-postgres://${POSTGRES_USER:-tapetum}:${POSTGRES_PASSWORD:-tapetum}@db:5432/${POSTGRES_DB:-tapetum}?sslmode=disable}
       TAPETUM_ADDR: ":8080"
       TAPETUM_PPROF_ADDR: ${TAPETUM_PPROF_ADDR:-}
-    sysctls:
-      # Larger kernel UDP receive ceiling for RTSP-over-UDP ingest; lets the
-      # app's 4MB SO_RCVBUF absorb 8MP bitrate bursts when transport=udp.
-      # (rmem_default can't be namespaced by some runc/kernel combos — the
-      # app sets its own buffer size, so only the ceiling is needed.)
-      net.core.rmem_max: 8388608
     volumes:
       - tapetum-data:/data
     depends_on:
