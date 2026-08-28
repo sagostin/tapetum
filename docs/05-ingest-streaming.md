@@ -58,16 +58,19 @@ Each enabled camera gets a supervised worker pair (main + optional sub stream):
 
 - `POST /streams/{cam}/webrtc` with SDP offer → answer; trickle ICE over same
   route. No STUN needed on LAN; TURN optional config for remote access.
-- Source: HLS over plain HTTP — the browser fetches `/streams/{cam}/live.m3u8`
-   and consumes the recorder's most recent fMP4 segments via hls.js. No ICE,
-   no peer connections, no UDP, no STUN/TURN — works behind any proxy /
-   NAT / LAN. H.265 cameras are transparently transcoded to H.264 via the
-   `?transcode=h264` query param (see `docs/03-api.md`).
+- Source: `MediaSource` + `appendBuffer` over a chunked HTTP response from
+   `/streams/{cam}/live.mp4` (UniFi Protect-style). The server emits the
+   init segment (ftyp+moov) followed by one `moof`/`mdat` pair per access
+   unit as frames arrive; the browser just appendBuffer's each chunk — no
+   segment boundaries, no playlist polling, ~100 ms glass-to-glass.
+   H.265 cameras can't do this path yet; they use the HLS endpoint below
+   with `?transcode=h264`. HLS is the secondary transport — same recorder
+   segments, hls.js, 1 s segments + `liveSyncDurationCount:1`. HLS, in
+   turn, falls back to MJPEG.
  - **Latency**: recorder cuts at ~1s segments (`targetSegDur` in
-   `internal/record/recorder.go`); hls.js sits on the live edge with a
-   1-segment DVR window (`liveSyncDurationCount:1`, `maxBufferLength:1`).
-   Glass-to-glass is ~1–2s end-to-end — UI3-style live feel.
- - Max peers per camera (default 4) → overflow clients fall back.
+   `internal/record/recorder.go`); fMP4 mode has no segment boundaries
+   (sub-frame latency). HLS sits on the live edge with a 1-segment DVR
+   window (`liveSyncDurationCount:1`, `maxBufferLength:1`) for ~1–2 s.
  - H.265-only cameras: transcode to H.264 via ffmpeg on demand (flagged
    per-camera; off by default, CPU warning in UI).
 

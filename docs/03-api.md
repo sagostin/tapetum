@@ -112,7 +112,8 @@ advertised device-service XAddr (preferred) or the URL we probed.
 | Method | Path | Perm | Description |
 |---|---|---|---|
 | GET | `/streams/{cameraId}/live.m3u8` | live | HLS playlist of the camera's most recent main-stream segments (server-recorded fMP4). Add `?transcode=h264` for H.265 cameras (lazily transcoded to H.264; same query param is honored by `/segments/{id}` and `/playback/{cam}/init.mp4`). |
-| GET | `/streams/{cameraId}/mjpeg` | live | MJPEG fallback at ~1fps (sub-stream preferred, scaled ≤960px). Used automatically by the dashboard tile when HLS fails to start. |
+| GET | `/streams/{cameraId}/live.mp4` | live | Continuous fragmented MP4 byte stream (UniFi Protect-style). Server emits one `ftyp`/`moov` init then one `moof`/`mdat` per access unit as frames arrive; browser consumes via `MediaSource` + `appendBuffer`. ~100 ms glass-to-glass, no segment boundaries mid-stream. H.264 only — H.265 cameras should use `/live.m3u8?transcode=h264`. |
+| GET | `/streams/{cameraId}/mjpeg` | live | MJPEG fallback at ~1fps (sub-stream preferred, scaled ≤960px). Used automatically by the dashboard tile when HLS/fMP4 fails to start. |
 | GET | `/streams/{cameraId}/live.m3u8` | live | Short-window HLS of recent segments (near-live, ~10s delay) |
 | WS | `/ws` | any | Push channel: `camera.status`, `event.created`, `export.done`, `storage.warning` |
 

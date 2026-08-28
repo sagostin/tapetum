@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"sort"
 	"strconv"
 	"time"
 
@@ -194,28 +195,42 @@ func (s *Server) availability(w http.ResponseWriter, r *http.Request) {
 // requested range so hls.js doesn't see an inflated EXTINF on the leading
 // or trailing fragment (which can confuse buffer/end-of-stream logic).
 func buildPlaylist(camID string, segs []*record.Segment, live bool, transcode bool, windowStart, windowEnd time.Time) string {
-	var b []byte
-	p := func(format string, args ...any) {
-		b = append(b, fmt.Sprintf(format, args...)...)
+	var out []byte
+	w := func(format string, args ...any) {
+		out = append(out, fmt.Sprintf(format, args...)...)
 	}
 	// EXT-X-TARGETDURATION must be >= the longest segment duration. The recorder
 	// cuts at ~1s (UI3-style low live latency); round up for safety.
-	p("#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-TARGETDURATION:2\n#EXT-X-MEDIA-SEQUENCE:0\n")
+	// EXT-X-MEDIA-SEQUENCE: index of the first segment in this playlist.
+	// For rolling live playlists this drifts up over time so hls.js knows
+	// to drop the oldest segments from its buffer.
+	firstSeq := 0
+	if len(segs) > 0 {
+		firstSeq = segs[0].SequenceNumber
+	}
+	w("#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-TARGETDURATION:2\n#EXT-X-MEDIA-SEQUENCE:%d\n", firstSeq)
 	if !live {
-		p("#EXT-X-PLAYLIST-TYPE:VOD\n")
+		w("#EXT-X-PLAYLIST-TYPE:VOD\n")
 	}
 	if transcode {
-		p("#EXT-X-MAP:URI=\"/api/v1/playback/%s/init.mp4?transcode=1\"\n", camID)
+		w("#EXT-X-MAP:URI=\"/api/v1/playback/%s/init.mp4?transcode=1\"\n", camID)
 	} else {
-		p("#EXT-X-MAP:URI=\"/api/v1/playback/%s/init.mp4\"\n", camID)
+		w("#EXT-X-MAP:URI=\"/api/v1/playback/%s/init.mp4\"\n", camID)
 	}
-	if live {
-		// Keep historical event semantics for live; not used after the rewrite below.
+	// Median duration for gap detection (controls EXT-X-DISCONTINUITY).
+	median := 0.0
+	if len(segs) > 1 {
+		durs := make([]float64, len(segs))
+		for i, s := range segs {
+			durs[i] = s.End.Sub(s.Start).Seconds()
+		}
+		sort.Float64s(durs)
+		median = durs[len(durs)/2]
 	}
 	for i, s := range segs {
 		start := s.Start
 		end := s.End
-		// Clamp first/last to the requested window so EXTINF reflects what
+		// Clamp first/last to the requested range so EXTINF reflects what
 		// we'll actually deliver to the player.
 		if i == 0 && start.Before(windowStart) {
 			start = windowStart
@@ -227,18 +242,31 @@ func buildPlaylist(camID string, segs []*record.Segment, live bool, transcode bo
 		if dur <= 0 {
 			dur = 0.001
 		}
-		p("#EXT-X-PROGRAM-DATE-TIME:%s\n", start.UTC().Format("2006-01-02T15:04:05.000Z"))
-		p("#EXTINF:%.3f,\n", dur)
+		// EXT-X-DISCONTINUITY across gaps > 2× median (or > 2s when too few
+		// segments to median). Without this hls.js carries the previous
+		// segment's decoder state across the gap and produces green frames.
+		if i > 0 {
+			gap := s.Start.Sub(segs[i-1].End).Seconds()
+			threshold := median * 2
+			if median == 0 {
+				threshold = 2.0
+			}
+			if gap > threshold {
+				w("#EXT-X-DISCONTINUITY\n")
+			}
+		}
+		w("#EXT-X-PROGRAM-DATE-TIME:%s\n", start.UTC().Format("2006-01-02T15:04:05.000Z"))
+		w("#EXTINF:%.3f,\n", dur)
 		if transcode {
-			p("/api/v1/segments/%s?transcode=h264\n", s.ID)
+			w("/api/v1/segments/%s?transcode=h264\n", s.ID)
 		} else {
-			p("/api/v1/segments/%s\n", s.ID)
+			w("/api/v1/segments/%s\n", s.ID)
 		}
 	}
 	if !live {
-		p("#EXT-X-ENDLIST\n")
+		w("#EXT-X-ENDLIST\n")
 	}
-	return string(b)
+	return string(out)
 }
 
 // wantsTranscode reports whether the client asked for transcoded H.264.

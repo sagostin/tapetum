@@ -23,6 +23,11 @@ type Segment struct {
 	SizeBytes int64     `json:"size_bytes"`
 	HasMotion bool      `json:"has_motion"`
 	Protected bool      `json:"protected"`
+	// SequenceNumber is a stable, monotonic integer used as the HLS
+	// media-sequence for this segment. We use the start_ts epoch second so
+	// successive playlist fetches naturally show advancing values when
+	// older segments age out of the rolling window.
+	SequenceNumber int `json:"sequence_number"`
 }
 
 // Gap is a recording_gaps row (end zero-value while open).
@@ -57,6 +62,11 @@ func scanSegment(row pgx.Row) (*Segment, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Derive a monotonic sequence number from the wall-clock start time.
+	// No DB column needed: each camera's segments are unique by start_ts,
+	// and start_ts only increases, so this gives the EXT-X-MEDIA-SEQUENCE
+	// monotonicity hls.js requires for live playlists.
+	s.SequenceNumber = int(s.Start.Unix())
 	return &s, nil
 }
 

@@ -1,21 +1,30 @@
 <script setup lang="ts">
 /**
- * UI3 live player.
+ * Live player.
  *
- * Streams a camera's recent fMP4 recordings as HLS via hls.js
- * (`GET /api/v1/streams/{cam}/live.m3u8`) — same plain HTTP, no ICE, no UDP,
- * no peer connections. Falls back to MJPEG (`<img>` multipart) if HLS fails
- * to start. The audio track isn't streamed live; audio is recorded-only.
+ * Streams a camera's main-stream access units as a continuous fragmented
+ * MP4 byte stream (UniFi Protect-style) — the browser consumes it via
+ * MediaSource Extensions, appendBuffer'ing each moof+mdat chunk as it
+ * arrives. No ICE, no peer connections, no UDP, no STUN/TURN, no segment
+ * boundaries mid-stream. Glass-to-glass latency matches the camera
+ * pipeline (~50-200 ms beyond the network).
+ *
+ * Falls back to HLS (1s segments via hls.js) when fMP4 is unsupported or
+ * the server returns an error. HLS, in turn, falls back to MJPEG.
+ *
+ * Audio isn't streamed live — it's recorded-only (recorder writes audio
+ * into the segments, but the live path is video-only).
  */
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import Hls, { type ErrorData } from 'hls.js'
 
 type Fit = 'contain' | 'cover'
+type Mode = 'fmp4' | 'hls' | 'mjpeg'
 
 const props = withDefaults(
   defineProps<{
     cameraId: string
-    /** Ignored for live HLS — the server only records the main stream. Kept
+    /** Ignored for live — the server only records/streams the main stream. Kept
      *  for API compatibility with the previous player. */
     stream?: 'sub' | 'main'
     muted?: boolean
@@ -42,20 +51,26 @@ const props = withDefaults(
 )
 
 const emit = defineEmits<{
-  (e: 'mode', mode: 'hls' | 'mjpeg'): void
+  (e: 'mode', mode: Mode): void
 }>()
 
-const mode = ref<'hls' | 'mjpeg'>('hls')
+const mode = ref<Mode>('fmp4')
 const videoEl = ref<HTMLVideoElement | null>(null)
 const rootEl = ref<HTMLDivElement | null>(null)
 
 let hls: Hls | null = null
+let mse: MediaSource | null = null
+let mseSourceBuffer: SourceBuffer | null = null
+let mseReader: ReadableStreamDefaultReader<Uint8Array> | null = null
+let mseAbort: AbortController | null = null
+let mseQueue: Uint8Array[] = []
+let mseAppending = false
 let destroyed = false
 let observer: IntersectionObserver | null = null
 let visible = false
 let pendingStart = false
 
-function setMode(m: 'hls' | 'mjpeg') {
+function setMode(m: Mode) {
   if (mode.value === m) return
   mode.value = m
   emit('mode', m)
@@ -65,62 +80,190 @@ function mjpegUrl() {
   return `/api/v1/streams/${props.cameraId}/mjpeg`
 }
 
+function fmp4Url() {
+  return `/api/v1/streams/${props.cameraId}/live.mp4`
+}
+
 function hlsUrl() {
-  // ?transcode=h264 — server transcodes H.265 main segments on demand.
   return `/api/v1/streams/${props.cameraId}/live.m3u8?transcode=h264`
 }
 
-function destroy() {
-  if (hls) {
-    hls.destroy()
-    hls = null
+function canPlayCodec(): boolean {
+  // h264 High 4.2 is what most IP cameras emit; this is the broadest match.
+  return MediaSource.isTypeSupported('video/mp4; codecs="avc1.640028"')
+}
+
+// --- fMP4 mode (Protect-style) ------------------------------------------
+
+function startFmp4() {
+  const video = videoEl.value
+  if (!video || typeof MediaSource === 'undefined' || !canPlayCodec()) {
+    return false
+  }
+
+  stopFmp4()
+  mse = new MediaSource()
+  mseAbort = new AbortController()
+  video.src = URL.createObjectURL(mse)
+
+  // MediaSource.readyState transitions to 'open' async; register listeners
+  // before opening the stream so we can pipe init + parts into SourceBuffer.
+  mse.addEventListener('sourceopen', () => onSourceOpen(video))
+  mse.addEventListener('error', () => {
+    if (!destroyed) startHlsFallback()
+  })
+  return true
+}
+
+function onSourceOpen(video: HTMLVideoElement) {
+  if (!mse || mseSourceBuffer) return
+  mseSourceBuffer = mse.addSourceBuffer('video/mp4; codecs="avc1.640028"')
+  mseSourceBuffer.mode = 'segments' // appendBuffer is queued automatically
+
+  fetch(fmp4Url(), { signal: mseAbort?.signal })
+    .then((res) => {
+      if (!res.ok || !res.body) {
+        throw new Error(`HTTP ${res.status}`)
+      }
+      mseReader = res.body.getReader()
+      pumpFmp4Chunks(video)
+    })
+    .catch((err) => {
+      if (destroyed) return
+      // SourceBuffer.appendBuffer errors throw QuotaExceededError when the
+      // buffer is full; everything else falls back to HLS.
+      if (!(err instanceof DOMException) || err.name !== 'AbortError') {
+        startHlsFallback()
+      }
+    })
+}
+
+function pumpFmp4Chunks(video: HTMLVideoElement) {
+  if (!mseReader || !mseSourceBuffer) return
+  mseReader
+    .read()
+    .then(({ done, value }) => {
+      if (done || destroyed) return
+      if (value && value.byteLength > 0) {
+        mseQueue.push(value)
+        drainFmp4Queue(video)
+      }
+      // Schedule next read; loop back even on empty reads so we keep
+      // pulling chunks as the server flushes them.
+      pumpFmp4Chunks(video)
+    })
+    .catch(() => {
+      // Network closed — fall back so the tile keeps showing something.
+      if (!destroyed) startHlsFallback()
+    })
+}
+
+function drainFmp4Queue(_video: HTMLVideoElement) {
+  if (!mseSourceBuffer || mseAppending || mseQueue.length === 0) return
+  // Concatenate queued chunks into one append — SourceBuffer can't have two
+  // pending appendBuffer calls at once, so merging amortizes the overhead
+  // and avoids callback juggling.
+  let total = 0
+  for (const c of mseQueue) total += c.byteLength
+  const merged = new Uint8Array(total)
+  let off = 0
+  while (mseQueue.length > 0) {
+    const c = mseQueue.shift()!
+    merged.set(c, off)
+    off += c.byteLength
+  }
+  mseAppending = true
+  try {
+    mseSourceBuffer.appendBuffer(merged.buffer)
+  } catch {
+    mseAppending = false
+    if (!destroyed) startHlsFallback()
+    return
+  }
+  // The 'updateend' event fires when SourceBuffer has fully ingested the
+  // buffer; we then drain the next chunk or, when the buffer is empty and
+  // the stream is ended, kick playback.
+  const onUpdateEnd = () => {
+    if (!mseSourceBuffer) return
+    mseSourceBuffer.removeEventListener('updateend', onUpdateEnd)
+    mseAppending = false
+    if (videoEl.value && videoEl.value.paused) {
+      videoEl.value.play().catch(() => {})
+    }
+    drainFmp4Queue(videoEl.value!)
+  }
+  mseSourceBuffer.addEventListener('updateend', onUpdateEnd)
+}
+
+function stopFmp4() {
+  if (mseAbort) {
+    mseAbort.abort()
+    mseAbort = null
+  }
+  if (mseReader) {
+    mseReader.cancel().catch(() => {})
+    mseReader = null
+  }
+  if (mseSourceBuffer) {
+    try {
+      mseSourceBuffer.abort()
+    } catch {
+      // ignore
+    }
+    mseSourceBuffer = null
+  }
+  if (mse) {
+    try {
+      if (mse.readyState === 'open') mse.endOfStream()
+    } catch {
+      // ignore
+    }
+    mse = null
+  }
+  mseQueue = []
+  mseAppending = false
+  if (videoEl.value) {
+    if (videoEl.value.src.startsWith('blob:')) {
+      URL.revokeObjectURL(videoEl.value.src)
+    }
+    videoEl.value.removeAttribute('src')
+    videoEl.value.load()
   }
 }
 
-function startHls() {
+// --- HLS fallback (hls.js over the existing endpoint) -------------------
+
+function startHlsFallback() {
+  stopFmp4()
   const video = videoEl.value
   if (!video) return
-  destroy()
+  setMode('hls')
 
   if (Hls.isSupported()) {
-    // UI3-style low-latency live: ~1s segments on the server, sit on the
-    // live edge with a 1-segment DVR window. hls.js's default of 3
-    // segments of buffer adds ~3s of glass-to-glass latency on top of the
-    // 1s segment target — drop both to 1.
     const instance = new Hls({
       liveSyncDurationCount: 1,
       maxBufferLength: 1,
       maxMaxBufferLength: 1,
       backBufferLength: 0,
-      manifestLoadingMaxRetry: 3,
-      levelLoadingMaxRetry: 3,
-      fragLoadingMaxRetry: 3,
-      // Don't retry a broken segment forever; give up so MJPEG fallback
-      // can kick in instead of locking up the tile.
+      manifestLoadingMaxRetry: 2,
+      levelLoadingMaxRetry: 2,
+      fragLoadingMaxRetry: 2,
       fragLoadingMaxRetryTimeout: 8000,
     })
     hls = instance
     instance.on(Hls.Events.MANIFEST_PARSED, () => {
-      video.play().catch(() => {
-        // Autoplay blocked — user gesture can resume.
-      })
+      video.play().catch(() => {})
     })
-    instance.on(Hls.Events.ERROR, (_event: typeof Hls.Events.ERROR, data: ErrorData) => {
+    instance.on(Hls.Events.ERROR, (_e: typeof Hls.Events.ERROR, data: ErrorData) => {
       if (!data.fatal) return
-      destroy()
+      destroyHls()
       if (!destroyed) setMode('mjpeg')
     })
     instance.loadSource(hlsUrl())
     instance.attachMedia(video)
   } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
     video.src = hlsUrl()
-    video.addEventListener(
-      'loadedmetadata',
-      () => {
-        video.play().catch(() => {})
-      },
-      { once: true },
-    )
+    video.addEventListener('loadedmetadata', () => video.play().catch(() => {}), { once: true })
     video.addEventListener(
       'error',
       () => {
@@ -133,28 +276,42 @@ function startHls() {
   }
 }
 
+function destroyHls() {
+  if (hls) {
+    hls.destroy()
+    hls = null
+  }
+}
+
 function stopHls() {
-  destroy()
+  destroyHls()
   if (videoEl.value) {
     videoEl.value.removeAttribute('src')
     videoEl.value.load()
   }
 }
 
+// --- orchestration ------------------------------------------------------
+
 function start() {
   if (!visible) {
     pendingStart = true
     return
   }
-  setMode('hls')
-  // Wait a tick so the video element is actually in the DOM (v-show toggles).
+  stopFmp4()
+  stopHls()
+  // Prefer the Protect-style fMP4 path; fall through to HLS on error.
+  setMode('fmp4')
   requestAnimationFrame(() => {
     if (destroyed || !visible) return
-    startHls()
+    if (!startFmp4()) {
+      startHlsFallback()
+    }
   })
 }
 
 function stop() {
+  stopFmp4()
   stopHls()
 }
 
@@ -171,7 +328,7 @@ onMounted(() => {
             }
           } else {
             stop()
-            if (mode.value === 'mjpeg') setMode('hls')
+            if (mode.value === 'mjpeg') setMode('fmp4')
           }
         }
       },
@@ -215,7 +372,7 @@ defineExpose({ mode })
   <div ref="rootEl" class="live-player" :class="{ 'live-rotated': isRotated }">
     <div class="live-frame">
       <video
-        v-show="mode === 'hls'"
+        v-show="mode === 'fmp4' || mode === 'hls'"
         ref="videoEl"
         class="live-media"
         :class="`live-fit-${fit}`"

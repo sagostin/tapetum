@@ -145,7 +145,7 @@ func main() {
 	go partitionTicker(ctx, evStore)
 
 	srv := api.NewServer(cfg, pool, hub, version, cams, segs, backend, resolve,
-		s3m, st, ing, exp, tc, evStore, notifyStore, notifyWorker)
+		s3m, st, ing, exp, tc, liveHub, evStore, notifyStore, notifyWorker)
 	srv.OnCameraChange = func(ctx context.Context, camID string, deleted bool) {
 		if deleted {
 			detectSup.Remove(camID)

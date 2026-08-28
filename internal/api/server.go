@@ -15,6 +15,7 @@ import (
 	"github.com/sagostin/tapetum/internal/events"
 	"github.com/sagostin/tapetum/internal/export"
 	"github.com/sagostin/tapetum/internal/ingest"
+	"github.com/sagostin/tapetum/internal/live"
 	"github.com/sagostin/tapetum/internal/notify"
 	"github.com/sagostin/tapetum/internal/record"
 	"github.com/sagostin/tapetum/internal/settings"
@@ -39,6 +40,7 @@ type Server struct {
 	ingest       *ingest.Supervisor
 	exporter     *export.Worker
 	transcode    *transcode.Service
+	liveHub      *live.Hub
 	evStore      *events.Store
 	notifyStore  *notify.Store
 	notifyWorker *notify.Worker
@@ -54,6 +56,7 @@ func NewServer(cfg *config.Config, pool *pgxpool.Pool, hub *ws.Hub, version stri
 	cams *camera.Store, segs *record.Store, backend storage.Backend,
 	resolve storage.Resolver, s3m *storage.S3Manager, st *settings.Store,
 	ing *ingest.Supervisor, exp *export.Worker, tc *transcode.Service,
+	liveHub *live.Hub,
 	evStore *events.Store, notifyStore *notify.Store, notifyWorker *notify.Worker,
 ) *Server {
 	return &Server{
@@ -71,6 +74,7 @@ func NewServer(cfg *config.Config, pool *pgxpool.Pool, hub *ws.Hub, version stri
 		ingest:       ing,
 		exporter:     exp,
 		transcode:    tc,
+		liveHub:      liveHub,
 		evStore:      evStore,
 		notifyStore:  notifyStore,
 		notifyWorker: notifyWorker,
@@ -164,6 +168,7 @@ func (s *Server) Router() http.Handler {
 		// fallback when the recorder hasn't produced a segment yet.
 		r.With(s.require(auth.PermLive)).Get("/streams/{cameraId}/mjpeg", s.mjpeg)
 		r.With(s.require(auth.PermLive)).Get("/streams/{cameraId}/live.m3u8", s.livePlaylist)
+		r.With(s.require(auth.PermLive)).Get("/streams/{cameraId}/live.mp4", s.liveMP4)
 
 		// Recordings & playback.
 		r.With(s.require(auth.PermPlayback)).Get("/recordings/timeline", s.timeline)
