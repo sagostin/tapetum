@@ -22,8 +22,12 @@ const (
 	// videoClock is the RTP/H26x clock rate, used as the fMP4 video timescale.
 	videoClock = 90000
 	// targetSegDur / maxSegWait: cut at first IDR once the segment is at
-	// least targetSegDur old; never cut mid-GOP (docs/05).
-	targetSegDur = 6 * time.Second
+	// least targetSegDur old; never cut mid-GOP (docs/05). Kept short
+	// (1s) so the live HLS playlist serves each tile with ~1-2s of glass-
+	// to-glass latency (UI3-style). Trades more recording_segments rows
+	// (1 per second per camera) for live latency — Postgres handles this
+	// trivially.
+	targetSegDur = 1 * time.Second
 	// preRollRing is how much footage record_mode=motion keeps before an
 	// event starts (docs/05: 10s ring buffer).
 	preRollRing = 10 * time.Second

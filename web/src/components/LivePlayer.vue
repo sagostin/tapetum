@@ -83,14 +83,20 @@ function startHls() {
   destroy()
 
   if (Hls.isSupported()) {
+    // UI3-style low-latency live: ~1s segments on the server, sit on the
+    // live edge with a 1-segment DVR window. hls.js's default of 3
+    // segments of buffer adds ~3s of glass-to-glass latency on top of the
+    // 1s segment target — drop both to 1.
     const instance = new Hls({
-      liveSyncDurationCount: 3,
-      backBufferLength: 120,
+      liveSyncDurationCount: 1,
+      maxBufferLength: 1,
+      maxMaxBufferLength: 1,
+      backBufferLength: 0,
       manifestLoadingMaxRetry: 3,
       levelLoadingMaxRetry: 3,
       fragLoadingMaxRetry: 3,
-      // Avoid hls.js trying to recover forever on a misconfigured stream
-      // — give up and let the tile fall back to MJPEG.
+      // Don't retry a broken segment forever; give up so MJPEG fallback
+      // can kick in instead of locking up the tile.
       fragLoadingMaxRetryTimeout: 8000,
     })
     hls = instance

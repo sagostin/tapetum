@@ -198,7 +198,9 @@ func buildPlaylist(camID string, segs []*record.Segment, live bool, transcode bo
 	p := func(format string, args ...any) {
 		b = append(b, fmt.Sprintf(format, args...)...)
 	}
-	p("#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-TARGETDURATION:10\n#EXT-X-MEDIA-SEQUENCE:0\n")
+	// EXT-X-TARGETDURATION must be >= the longest segment duration. The recorder
+	// cuts at ~1s (UI3-style low live latency); round up for safety.
+	p("#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-TARGETDURATION:2\n#EXT-X-MEDIA-SEQUENCE:0\n")
 	if !live {
 		p("#EXT-X-PLAYLIST-TYPE:VOD\n")
 	}

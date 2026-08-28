@@ -38,9 +38,14 @@ func NewService(dataDir string) (*Service, error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, err
 	}
+	// 4 slots: the recorder cuts at ~1s segments now (UI3-style low live
+	// latency), so H.265 → H.264 segment transcodes arrive at the rate of
+	// (h265-cameras × viewers) per second. Two concurrent viewers per H.265
+	// camera fit comfortably; more fall through to ErrBusy (the client
+	// retries naturally since the segment will be cached on the next hit).
 	return &Service{
 		dir:      dir,
-		sem:      make(chan struct{}, 2),
+		sem:      make(chan struct{}, 4),
 		log:      slog.With("component", "transcode"),
 		inflight: map[string]chan error{},
 	}, nil

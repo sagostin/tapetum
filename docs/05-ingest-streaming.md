@@ -63,6 +63,10 @@ Each enabled camera gets a supervised worker pair (main + optional sub stream):
    no peer connections, no UDP, no STUN/TURN — works behind any proxy /
    NAT / LAN. H.265 cameras are transparently transcoded to H.264 via the
    `?transcode=h264` query param (see `docs/03-api.md`).
+ - **Latency**: recorder cuts at ~1s segments (`targetSegDur` in
+   `internal/record/recorder.go`); hls.js sits on the live edge with a
+   1-segment DVR window (`liveSyncDurationCount:1`, `maxBufferLength:1`).
+   Glass-to-glass is ~1–2s end-to-end — UI3-style live feel.
  - Max peers per camera (default 4) → overflow clients fall back.
  - H.265-only cameras: transcode to H.264 via ffmpeg on demand (flagged
    per-camera; off by default, CPU warning in UI).
