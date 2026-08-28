@@ -22,7 +22,26 @@ type Frame struct {
 const maxRingFrames = 120
 
 // subBuf is the per-subscriber channel capacity; slow subscribers are dropped.
-const subBuf = 128
+// Sized so a transient network/CPU hiccup doesn't immediately evict the
+// viewer — at 30fps, 256 frames is ~8.5s of buffer, well past any normal
+// browser decode stall. A truly stuck consumer (e.g. tab in background
+// holding back-pressure for minutes) still gets dropped so the broadcaster
+// never blocks behind one slow viewer.
+const subBuf = 256
+
+// subscriber wraps a raw channel with a one-shot close. The slow-consumer path
+// in Offer and the cancel func returned from Subscribe both want to close the
+// channel — sync.Once makes sure only one of them actually does, so the rebase
+// goroutine that reads from raw always sees exactly one close signal.
+type subscriber struct {
+	raw       chan Frame
+	closeOnce sync.Once
+}
+
+// close shuts down the raw channel. Safe to call multiple times.
+func (s *subscriber) close() {
+	s.closeOnce.Do(func() { close(s.raw) })
+}
 
 type streamState struct {
 	mu     sync.Mutex
@@ -31,7 +50,7 @@ type streamState struct {
 	pps    []byte
 	vps    []byte
 	ring   []Frame
-	subs   map[chan Frame]struct{}
+	subs   map[*subscriber]struct{}
 	closed bool // stream torn down; Offer returns early
 }
 
@@ -64,7 +83,7 @@ func (h *Hub) getOrCreate(k streamKey) *streamState {
 	defer h.mu.Unlock()
 	st, ok = h.streams[k]
 	if !ok {
-		st = &streamState{subs: map[chan Frame]struct{}{}}
+		st = &streamState{subs: map[*subscriber]struct{}{}}
 		h.streams[k] = st
 	}
 	return st
@@ -80,9 +99,9 @@ func (h *Hub) Begin(camID string, sub bool, codec string, sps, pps, vps []byte) 
 	st.codec = codec
 	st.sps, st.pps, st.vps = sps, pps, vps
 	st.ring = nil
-	for ch := range st.subs {
-		delete(st.subs, ch)
-		close(ch)
+	for s := range st.subs {
+		delete(st.subs, s)
+		s.close()
 	}
 }
 
@@ -107,14 +126,14 @@ func (h *Hub) Offer(camID string, sub bool, au [][]byte, pts int64) {
 	if len(st.ring) > maxRingFrames {
 		st.ring = st.ring[len(st.ring)-maxRingFrames:]
 	}
-	for ch := range st.subs {
+	for s := range st.subs {
 		select {
-		case ch <- f:
+		case s.raw <- f:
 		default:
 			// slow consumer: a dropped P-frame breaks decode, so drop the
 			// subscriber instead — it will resubscribe at a keyframe
-			delete(st.subs, ch)
-			close(ch)
+			delete(st.subs, s)
+			s.close()
 		}
 	}
 }
@@ -122,6 +141,16 @@ func (h *Hub) Offer(camID string, sub bool, au [][]byte, pts int64) {
 // Subscribe attaches a consumer to a stream. The current ring (from the
 // latest keyframe) is replayed into the channel before live frames; the
 // codec parameter sets are returned for decoder/bootstrap use.
+//
+// Every frame delivered to this subscriber has its PTS rebased so the first
+// replayed ring frame is at PTS=0. Without this, a viewer joining a camera
+// that's been running for hours would see a stream whose first sample sits
+// 50+ minutes into the future — the browser's MSE timeline starts at 0 and
+// the player shows a black tile until playback reaches that timestamp.
+//
+// The rebase is done by a per-subscriber goroutine that owns the raw channel
+// registered in st.subs; Offer pushes absolute-PTS frames to it, the
+// goroutine subtracts startPTS and forwards to the returned (rebased) channel.
 // ok=false means the stream has no active session.
 func (h *Hub) Subscribe(camID string, sub bool) (codec string, sps, pps, vps []byte, ch <-chan Frame, cancel func(), ok bool) {
 	h.mu.RLock()
@@ -135,21 +164,43 @@ func (h *Hub) Subscribe(camID string, sub bool) (codec string, sps, pps, vps []b
 		st.mu.Unlock()
 		return "", nil, nil, nil, nil, func() {}, false
 	}
-	c := make(chan Frame, subBuf)
+
+	// Lock in the rebase origin before releasing st.mu so subsequent Offers
+	// and ring appends can't move it under us. The first ring frame is always
+	// a keyframe (Offer clears the ring on every keyframe), so the PTS is
+	// stable and a safe rebase anchor.
+	startPTS := st.ring[0].PTS
+
+	newSub := &subscriber{raw: make(chan Frame, subBuf)}
+	out := make(chan Frame, subBuf)
+
+	// Replay the ring with rebased PTS — the consumer sees a stream that
+	// starts at the latest keyframe, time 0, ready to play immediately.
 	for _, f := range st.ring {
-		c <- f
+		out <- Frame{AU: f.AU, PTS: f.PTS - startPTS, Keyframe: f.Keyframe}
 	}
-	st.subs[c] = struct{}{}
+	st.subs[newSub] = struct{}{}
 	codec = st.codec
 	sps, pps, vps = st.sps, st.pps, st.vps
 	st.mu.Unlock()
 
+	// Forward live frames (still absolute PTS in `f`) into the rebased
+	// output channel. When raw closes — either via the slow-consumer path
+	// in Offer or the cancel func below — we drain and close `out`.
+	go func() {
+		defer close(out)
+		for f := range newSub.raw {
+			out <- Frame{AU: f.AU, PTS: f.PTS - startPTS, Keyframe: f.Keyframe}
+		}
+	}()
+
 	cancel = func() {
 		st.mu.Lock()
-		delete(st.subs, c)
+		delete(st.subs, newSub)
 		st.mu.Unlock()
+		newSub.close()
 	}
-	return codec, sps, pps, vps, c, cancel, true
+	return codec, sps, pps, vps, out, cancel, true
 }
 
 // SetParams updates the codec parameter sets of an active stream. Used when
@@ -192,9 +243,9 @@ func (h *Hub) remove(camID string, sub bool) {
 	delete(h.streams, k)
 	st.mu.Lock()
 	st.closed = true
-	for ch := range st.subs {
-		delete(st.subs, ch)
-		close(ch)
+	for s := range st.subs {
+		delete(st.subs, s)
+		s.close()
 	}
 	st.mu.Unlock()
 }
