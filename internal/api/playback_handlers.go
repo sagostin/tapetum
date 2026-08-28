@@ -490,7 +490,8 @@ func (s *Server) serveTranscodedSegment(w http.ResponseWriter, r *http.Request, 
 
 // --- MJPEG fallback ---------------------------------------------------------
 
-// mjpeg streams multipart JPEGs at ~2 fps from the snapshot cache.
+// mjpeg streams multipart JPEGs at ~1 fps from the snapshot cache (scaled,
+// sub-stream preferred, singleflight + decode-capped server-side).
 func (s *Server) mjpeg(w http.ResponseWriter, r *http.Request) {
 	camID := chi.URLParam(r, "cameraId")
 	u := auth.UserFrom(r.Context())
@@ -511,14 +512,14 @@ func (s *Server) mjpeg(w http.ResponseWriter, r *http.Request) {
 			return
 		default:
 		}
-		jpg, err := s.ingest.Snapshot(r.Context(), camID)
+		jpg, err := s.ingest.MJPEGFrame(r.Context(), camID)
 		if err == nil {
 			fmt.Fprintf(w, "--tapetum\r\nContent-Type: image/jpeg\r\nContent-Length: %d\r\n\r\n", len(jpg))
 			w.Write(jpg)
 			w.Write([]byte("\r\n"))
 			fl.Flush()
 		}
-		time.Sleep(500 * time.Millisecond)
+		time.Sleep(time.Second)
 	}
 }
 

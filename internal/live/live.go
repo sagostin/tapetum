@@ -152,6 +152,21 @@ func (h *Hub) Subscribe(camID string, sub bool) (codec string, sps, pps, vps []b
 	return codec, sps, pps, vps, c, cancel, true
 }
 
+// SetParams updates the codec parameter sets of an active stream. Used when
+// the parameters are learned in-band after Begin — e.g. H.265 cameras that
+// omit VPS/SPS/PPS from the SDP but repeat them before every IDR.
+func (h *Hub) SetParams(camID string, sub bool, sps, pps, vps []byte) {
+	h.mu.RLock()
+	st, ok := h.streams[streamKey{camID, sub}]
+	h.mu.RUnlock()
+	if !ok {
+		return
+	}
+	st.mu.Lock()
+	st.sps, st.pps, st.vps = sps, pps, vps
+	st.mu.Unlock()
+}
+
 // Codec returns the active codec ("h264"/"h265") for a stream, "" if none.
 func (h *Hub) Codec(camID string, sub bool) string {
 	h.mu.RLock()

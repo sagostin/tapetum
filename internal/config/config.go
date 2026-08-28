@@ -24,6 +24,7 @@ type ServerConfig struct {
 	PublicURL string `yaml:"public_url"` // external URL used in notification links
 	DataDir   string `yaml:"data_dir"`   // default ./data
 	Dev       bool   `yaml:"dev"`        // relaxes Secure cookie flag for http://localhost
+	PprofAddr string `yaml:"pprof_addr"` // pprof listen address (e.g. ":6060"); empty = disabled
 }
 
 type DatabaseConfig struct {
@@ -75,6 +76,7 @@ func applyEnv(c *Config) {
 	set("TAPETUM_DATA_DIR", &c.Server.DataDir)
 	set("TAPETUM_DATABASE_URL", &c.Database.URL)
 	set("TAPETUM_LOG_LEVEL", &c.Log.Level)
+	set("TAPETUM_PPROF_ADDR", &c.Server.PprofAddr)
 	if v, ok := os.LookupEnv("TAPETUM_DEV"); ok {
 		c.Server.Dev = v == "1" || strings.EqualFold(v, "true")
 	}

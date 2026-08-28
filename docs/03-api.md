@@ -111,8 +111,8 @@ advertised device-service XAddr (preferred) or the URL we probed.
 
 | Method | Path | Perm | Description |
 |---|---|---|---|
-| POST | `/streams/{cameraId}/webrtc` | live | WebRTC signaling: `{sdp, stream}` → `{sdp}` answer with all ICE candidates gathered server-side (no trickle). Errors: 409 `unsupported_codec` (H.265), 503 `stream_unavailable`, 429 `too_many_peers` — client falls back to MJPEG/HLS |
-| GET | `/streams/{cameraId}/mjpeg` | live | MJPEG fallback (sub-stream) |
+| POST | `/streams/{cameraId}/webrtc` | live | WebRTC signaling: `{sdp, stream}` → `{sdp}` answer with all ICE candidates gathered server-side (no trickle). `stream=sub` on a camera with no sub session falls back to the main stream (H.264 only). Errors: 409 `unsupported_codec` (H.265), 503 `stream_unavailable`, 429 `too_many_peers` — client falls back to MJPEG/HLS |
+| GET | `/streams/{cameraId}/mjpeg` | live | MJPEG fallback at ~1fps (sub-stream preferred, scaled ≤960px) |
 | GET | `/streams/{cameraId}/live.m3u8` | live | Short-window HLS of recent segments (near-live, ~10s delay) |
 | WS | `/ws` | any | Push channel: `camera.status`, `event.created`, `export.done`, `storage.warning` |
 

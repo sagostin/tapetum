@@ -68,6 +68,12 @@ func (s *Server) HandleOffer(ctx context.Context, camID, stream, offerSDP string
 	sub := stream != "main"
 
 	codec, _, _, _, ch, cancel, ok := s.hub.Subscribe(camID, sub)
+	if !ok && sub {
+		// Cameras without a sub stream: fall back to main over WebRTC (when
+		// it's H.264) instead of forcing the client onto the MJPEG path.
+		sub = false
+		codec, _, _, _, ch, cancel, ok = s.hub.Subscribe(camID, sub)
+	}
 	if !ok {
 		return "", ErrStreamUnavailable
 	}

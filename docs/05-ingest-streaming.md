@@ -67,8 +67,13 @@ Each enabled camera gets a supervised worker pair (main + optional sub stream):
 
 ### Fallbacks
 
-- **MJPEG** (`/streams/{cam}/mjpeg`): sub-stream keyframes/JPEG re-encode at
-  ~5fps. Works everywhere, useful for embedding.
+- **MJPEG** (`/streams/{cam}/mjpeg`): JPEG frames at ~1fps from the snapshot
+  cache (sub-stream preferred, scaled to ≤960px, singleflight + a global
+  ffmpeg decode cap of 2 — MJPEG can never peg the CPU). Works everywhere,
+  useful for embedding.
+- **WebRTC sub→main fallback**: a `stream=sub` offer for a camera with no
+  sub stream session is served from the main stream when it's H.264, instead
+  of pushing the client onto MJPEG.
 - **Near-live HLS** (`/streams/{cam}/live.m3u8`): playlist over the most
   recent N recorded segments. ~6–12s behind real time; zero extra work since
   recorder already produces the chunks.

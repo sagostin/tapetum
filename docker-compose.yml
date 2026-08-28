@@ -25,12 +25,19 @@ services:
     restart: unless-stopped
     ports:
       - "${APP_PORT:-8080}:8080"
+      - "${PPROF_BIND:-127.0.0.1:6060}:6060" # pprof; only serves if TAPETUM_PPROF_ADDR is set
     env_file:
       - path: .env
-        required: false # TAPETUM_DEV / PUBLIC_URL / SECRET_KEY / LOG_LEVEL
+        required: false # TAPETUM_DEV / PUBLIC_URL / SECRET_KEY / LOG_LEVEL / PPROF_ADDR
     environment:
       TAPETUM_DATABASE_URL: ${TAPETUM_DATABASE_URL:-postgres://${POSTGRES_USER:-tapetum}:${POSTGRES_PASSWORD:-tapetum}@db:5432/${POSTGRES_DB:-tapetum}?sslmode=disable}
       TAPETUM_ADDR: ":8080"
+      TAPETUM_PPROF_ADDR: ${TAPETUM_PPROF_ADDR:-}
+    sysctls:
+      # Larger kernel UDP receive buffers for RTSP-over-UDP ingest; prevents
+      # burst loss on high-bitrate cameras when transport=udp is used.
+      net.core.rmem_max: 8388608
+      net.core.rmem_default: 1048576
     volumes:
       - tapetum-data:/data
     depends_on:

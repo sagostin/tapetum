@@ -32,7 +32,7 @@ type Supervisor struct {
 
 	mu      sync.Mutex
 	workers map[string]*cameraWorker
-	snaps   map[string]*snapshot // camera ID → latest keyframe JPEG source
+	snaps   map[string]*snapshotSet // camera ID → per-stream keyframe sources
 }
 
 func NewSupervisor(cams *camera.Store, segs *record.Store, backend storage.Backend,
@@ -46,7 +46,7 @@ func NewSupervisor(cams *camera.Store, segs *record.Store, backend storage.Backe
 		live:    liveHub,
 		log:     slog.With("component", "ingest"),
 		workers: map[string]*cameraWorker{},
-		snaps:   map[string]*snapshot{},
+		snaps:   map[string]*snapshotSet{},
 	}
 }
 
@@ -104,7 +104,7 @@ func (s *Supervisor) Remove(camID string) {
 }
 
 func (s *Supervisor) addLocked(c *camera.Camera) {
-	snap := &snapshot{}
+	snap := newSnapshotSet()
 	s.snaps[c.ID] = snap
 	w := newCameraWorker(c, s.cams, s.segs, s.backend, s.hub, s.live, snap, s.log)
 	s.workers[c.ID] = w
@@ -150,17 +150,43 @@ func (s *Supervisor) WorkerCount() int {
 	return len(s.workers)
 }
 
-// Snapshot returns the latest decoded JPEG for a camera (sub-stream
-// preferred, main fallback). Results are cached briefly; decoding runs
-// through the ffmpeg helper.
+// Snapshot returns the latest decoded JPEG for a camera at full resolution
+// (main stream preferred, sub fallback) — used for event snapshots and the
+// /cameras/:id/snapshot endpoint. Results are cached briefly; decoding runs
+// through the ffmpeg helper with singleflight + a global concurrency cap.
 func (s *Supervisor) Snapshot(ctx context.Context, camID string) ([]byte, error) {
 	s.mu.Lock()
-	snap, ok := s.snaps[camID]
+	snaps, ok := s.snaps[camID]
 	s.mu.Unlock()
 	if !ok {
 		return nil, ErrNoSnapshot
 	}
-	return snap.jpeg(ctx)
+	jpg, err := snaps.main.jpeg(ctx, 0)
+	if errors.Is(err, ErrNoSnapshot) {
+		return snaps.sub.jpeg(ctx, 0)
+	}
+	return jpg, err
+}
+
+// mjpegFrameWidth bounds MJPEG tile frames — tiles are a few hundred px wide,
+// so decoding/encoding beyond this wastes CPU and bandwidth.
+const mjpegFrameWidth = 960
+
+// MJPEGFrame returns a scaled JPEG for the MJPEG live fallback (sub stream
+// preferred — much cheaper to decode than an 8MP main keyframe — main
+// fallback for cameras without a sub stream).
+func (s *Supervisor) MJPEGFrame(ctx context.Context, camID string) ([]byte, error) {
+	s.mu.Lock()
+	snaps, ok := s.snaps[camID]
+	s.mu.Unlock()
+	if !ok {
+		return nil, ErrNoSnapshot
+	}
+	jpg, err := snaps.sub.jpeg(ctx, mjpegFrameWidth)
+	if errors.Is(err, ErrNoSnapshot) {
+		return snaps.main.jpeg(ctx, mjpegFrameWidth)
+	}
+	return jpg, err
 }
 
 // formatDuration renders d compactly for status_detail (e.g. "1h23m").

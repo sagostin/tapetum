@@ -223,6 +223,7 @@ optional if env vars cover everything.
 | `server.public_url` | `TAPETUM_PUBLIC_URL` | — | External URL, used in notification links |
 | `server.data_dir` | `TAPETUM_DATA_DIR` | `./data` (`/data` in Docker) | Recordings, transcode cache, `server.key` |
 | `server.dev` | `TAPETUM_DEV` | `false` | "Plain-HTTP mode": drops the Secure cookie flag. **Required** for any non-TLS access (LAN IP included); turn off when serving over HTTPS |
+| `server.pprof_addr` | `TAPETUM_PPROF_ADDR` | — | Go pprof listen address (e.g. `:6060`); empty = off. **No auth** — keep it localhost-bound (compose: `PPROF_BIND`) |
 | `database.url` | `TAPETUM_DATABASE_URL` | `postgres://tapetum:tapetum@localhost:5432/tapetum?sslmode=disable` | Required Postgres |
 | `log.level` | `TAPETUM_LOG_LEVEL` | `info` | `debug` \| `info` \| `warn` \| `error` |
 | — | `TAPETUM_SECRET_KEY` | auto-generated | 64 hex chars; encrypts secrets at rest |

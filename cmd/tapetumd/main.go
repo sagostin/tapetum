@@ -7,6 +7,7 @@ import (
 	"flag"
 	"log/slog"
 	"net/http"
+	_ "net/http/pprof" // registers /debug/pprof/* on DefaultServeMux (pprof listener)
 	"os"
 	"os/signal"
 	"syscall"
@@ -175,11 +176,31 @@ func main() {
 		}
 	}()
 
+	// Optional pprof listener (TAPETUM_PPROF_ADDR / server.pprof_addr).
+	// Separate port, no auth — bind it to localhost / keep it unpublished.
+	var pprofSrv *http.Server
+	if cfg.Server.PprofAddr != "" {
+		pprofSrv = &http.Server{
+			Addr:              cfg.Server.PprofAddr,
+			Handler:           http.DefaultServeMux,
+			ReadHeaderTimeout: 10 * time.Second,
+		}
+		go func() {
+			slog.Info("pprof listening", "addr", cfg.Server.PprofAddr)
+			if err := pprofSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				slog.Error("pprof server failed", "err", err)
+			}
+		}()
+	}
+
 	<-ctx.Done()
 	slog.Info("shutting down")
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	_ = httpSrv.Shutdown(shutdownCtx)
+	if pprofSrv != nil {
+		_ = pprofSrv.Shutdown(shutdownCtx)
+	}
 }
 
 // bridgeMotionToRecorder toggles record_mode=motion recording windows from

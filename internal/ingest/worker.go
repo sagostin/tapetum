@@ -18,6 +18,7 @@ import (
 	"github.com/bluenviron/gortsplib/v5/pkg/format/rtph264"
 	"github.com/bluenviron/gortsplib/v5/pkg/format/rtph265"
 	"github.com/bluenviron/gortsplib/v5/pkg/format/rtpmpeg4audio"
+	"github.com/bluenviron/mediacommon/v2/pkg/codecs/h265"
 	"github.com/pion/rtp"
 
 	"github.com/sagostin/tapetum/internal/camera"
@@ -41,7 +42,7 @@ type cameraWorker struct {
 	backend storage.Backend
 	hub     *ws.Hub
 	live    *live.Hub
-	snap    *snapshot
+	snap    *snapshotSet
 	log     *slog.Logger
 
 	// decodeLogSampler throttles per-packet decode error logs to one per
@@ -61,13 +62,15 @@ type cameraWorker struct {
 	lastFrameAt time.Time
 	bytesTotal  atomic.Int64
 	framesTotal atomic.Int64
+	mainBytes   atomic.Int64 // main stream only — status bitrate/fps
+	mainFrames  atomic.Int64
 	startedAt   time.Time
 	status      camera.Status
 	detail      map[string]any
 }
 
 func newCameraWorker(cam *camera.Camera, cams *camera.Store, segs *record.Store,
-	backend storage.Backend, hub *ws.Hub, liveHub *live.Hub, snap *snapshot, log *slog.Logger,
+	backend storage.Backend, hub *ws.Hub, liveHub *live.Hub, snap *snapshotSet, log *slog.Logger,
 ) *cameraWorker {
 	ctx, cancel := context.WithCancel(context.Background())
 	rec := record.NewRecorder(cam.ID, segs, backend)
@@ -122,6 +125,7 @@ func (w *cameraWorker) run() {
 	}
 
 	// health ticker: bitrate/fps computation + status transitions
+	// (main-stream counters only — the sub stream would double the numbers)
 	t := time.NewTicker(5 * time.Second)
 	defer t.Stop()
 	var lastBytes, lastFrames int64
@@ -133,8 +137,8 @@ func (w *cameraWorker) run() {
 			w.setStatus(camera.StatusOffline, map[string]any{"last_error": "worker stopped"})
 			return
 		case <-t.C:
-			b := w.bytesTotal.Load()
-			f := w.framesTotal.Load()
+			b := w.mainBytes.Load()
+			f := w.mainFrames.Load()
 			bitrateKbps := float64(b-lastBytes) * 8 / 5 / 1000
 			fps := float64(f-lastFrames) / 5
 			lastBytes, lastFrames = b, f
@@ -202,6 +206,10 @@ func (w *cameraWorker) runSession(rawURL string, isSub bool) error {
 		ReadTimeout:  15 * time.Second,
 		WriteTimeout: 10 * time.Second,
 		Protocol:     protocolOf(w.cam.Transport),
+		// Userspace-side UDP socket buffer; with the compose sysctl
+		// (net.core.rmem_max=8MB) this absorbs 8MP bitrate bursts instead of
+		// dropping RTP at the kernel queue. Only used for transport=udp.
+		UDPReadBufferSize: 4 << 20,
 	}
 	if err := c.Start(); err != nil {
 		return err
@@ -264,6 +272,23 @@ func (w *cameraWorker) runSession(rawURL string, isSub bool) error {
 		}
 	}
 
+	// Some H.265 cameras omit VPS/SPS/PPS from the SDP but repeat them
+	// in-band before every IDR — recover them from the first keyframe so the
+	// recorder init segment, live subscribers, and snapshots all get them.
+	h265NeedParams := vcodec == "h265" && (len(vps) == 0 || len(sps) == 0 || len(pps) == 0)
+
+	// buildInit marshals the recorder's fMP4 init segment into status_detail.
+	// Deferred for H.265 cameras whose params arrive in-band (see above).
+	buildInit := func() {
+		initB64, err := record.BuildInit(vcodec, sps, pps, vps,
+			audioRateOf(aac), audioChannelsOf(aac))
+		if err == nil {
+			w.setDetail("init", initB64)
+		} else {
+			w.log.Warn("build init segment", "err", err)
+		}
+	}
+
 	if err := c.SetupAll(desc.BaseURL, medias); err != nil {
 		return err
 	}
@@ -295,6 +320,17 @@ func (w *cameraWorker) runSession(rawURL string, isSub bool) error {
 				}
 				return
 			}
+			if h265NeedParams && h265.IsRandomAccess(au) {
+				if v, s, p := extractH265Params(au); len(v) > 0 && len(s) > 0 && len(p) > 0 {
+					vps, sps, pps = v, s, p
+					h265NeedParams = false
+					w.live.SetParams(w.cam.ID, isSub, sps, pps, vps)
+					w.log.Info("h265 parameters recovered in-band", "sub", isSub)
+					if !isSub {
+						buildInit()
+					}
+				}
+			}
 			w.onVideoAU(au, pts, ptsOK, ntp, ntpOK, isSub, "h265", sps, pps, vps)
 		})
 	}
@@ -317,13 +353,9 @@ func (w *cameraWorker) runSession(rawURL string, isSub bool) error {
 		if rtpDecAAC != nil && aac.Config != nil {
 			w.recorder.SetAudio(int64(aac.Config.SampleRate))
 		}
-		initB64, err := record.BuildInit(vcodec, sps, pps, vps,
-			audioRateOf(aac), audioChannelsOf(aac))
-		if err == nil {
-			w.setDetail("init", initB64)
-			w.setDetail("codec", vcodec)
-		} else {
-			w.log.Warn("build init segment", "err", err)
+		w.setDetail("codec", vcodec)
+		if !h265NeedParams {
+			buildInit()
 		}
 	}
 
@@ -348,8 +380,13 @@ func (w *cameraWorker) runSession(rawURL string, isSub bool) error {
 func (w *cameraWorker) onVideoAU(au [][]byte, pts int64, ptsOK bool, ntp time.Time, ntpOK bool,
 	isSub bool, vcodec string, sps, pps, vps []byte,
 ) {
-	w.bytesTotal.Add(int64(auLen(au)))
+	n := int64(auLen(au))
+	w.bytesTotal.Add(n)
 	w.framesTotal.Add(1)
+	if !isSub {
+		w.mainBytes.Add(n)
+		w.mainFrames.Add(1)
+	}
 	w.mu.Lock()
 	w.lastFrameAt = time.Now()
 	w.mu.Unlock()
@@ -365,7 +402,7 @@ func (w *cameraWorker) onVideoAU(au [][]byte, pts int64, ptsOK bool, ntp time.Ti
 	if ptsOK {
 		w.live.Offer(w.cam.ID, isSub, au, pts)
 	}
-	w.snap.offer(au, vcodec, sps, pps, vps)
+	w.snap.offer(isSub, au, vcodec, sps, pps, vps)
 }
 
 func (w *cameraWorker) markUp(isSub, up bool) {
@@ -469,7 +506,10 @@ func protocolOf(transport string) *gortsplib.Protocol {
 	case "udp":
 		p = gortsplib.ProtocolUDP
 	case "auto":
-		return nil
+		// "auto" = TCP: reliable, lossless delivery is what an NVR wants;
+		// UDP's lower latency doesn't justify packet loss (corrupted frames,
+		// NACK storms on WebRTC fan-out) on LAN camera links.
+		p = gortsplib.ProtocolTCP
 	default:
 		p = gortsplib.ProtocolTCP
 	}
@@ -496,6 +536,26 @@ func auLen(au [][]byte) int {
 		n += len(nalu)
 	}
 	return n
+}
+
+// extractH265Params pulls VPS/SPS/PPS NAL units out of an access unit —
+// cameras that omit them from the SDP typically repeat them in-band before
+// each IDR.
+func extractH265Params(au [][]byte) (vps, sps, pps []byte) {
+	for _, nalu := range au {
+		if len(nalu) == 0 {
+			continue
+		}
+		switch (nalu[0] >> 1) & 0x3F {
+		case 32:
+			vps = nalu
+		case 33:
+			sps = nalu
+		case 34:
+			pps = nalu
+		}
+	}
+	return
 }
 
 func min(a, b int) int {

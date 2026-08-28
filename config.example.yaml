@@ -7,6 +7,8 @@ server:
   data_dir: "./data"        # TAPETUM_DATA_DIR — recordings, server.key, exports
   dev: false                # TAPETUM_DEV — plain-HTTP mode: drops the Secure cookie flag.
                             # Required for http:// access (incl. LAN IPs); off when behind HTTPS.
+  pprof_addr: ""            # TAPETUM_PPROF_ADDR — pprof listen addr (e.g. ":6060"); empty = off.
+                            # No auth — bind to localhost / never expose publicly.
 
 database:
   url: "postgres://tapetum:tapetum@localhost:5432/tapetum?sslmode=disable"  # TAPETUM_DATABASE_URL
