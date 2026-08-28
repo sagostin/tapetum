@@ -1,17 +1,21 @@
+# All deploy-time knobs live in .env (see .env.example) — you should not
+# need to edit this file. Compose reads .env automatically for both
+# interpolation below and (via env_file) the app's optional TAPETUM_* vars.
+
 services:
   db:
     image: postgres:16-alpine
     restart: unless-stopped
     ports:
-      - "5432:5432" # published for local dev (`make run`); remove in production
+      - "${DB_BIND:-127.0.0.1:5432}:5432" # localhost-only by default; safe to keep in prod
     environment:
-      POSTGRES_USER: tapetum
-      POSTGRES_PASSWORD: tapetum
-      POSTGRES_DB: tapetum
+      POSTGRES_USER: ${POSTGRES_USER:-tapetum}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-tapetum}
+      POSTGRES_DB: ${POSTGRES_DB:-tapetum}
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U tapetum -d tapetum"]
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
       interval: 5s
       timeout: 3s
       retries: 12
@@ -20,12 +24,13 @@ services:
     build: .
     restart: unless-stopped
     ports:
-      - "8080:8080"
+      - "${APP_PORT:-8080}:8080"
+    env_file:
+      - path: .env
+        required: false # TAPETUM_DEV / PUBLIC_URL / SECRET_KEY / LOG_LEVEL
     environment:
-      TAPETUM_DATABASE_URL: postgres://tapetum:tapetum@db:5432/tapetum?sslmode=disable
+      TAPETUM_DATABASE_URL: ${TAPETUM_DATABASE_URL:-postgres://${POSTGRES_USER:-tapetum}:${POSTGRES_PASSWORD:-tapetum}@db:5432/${POSTGRES_DB:-tapetum}?sslmode=disable}
       TAPETUM_ADDR: ":8080"
-      # TAPETUM_PUBLIC_URL: https://nvr.example.com
-      # TAPETUM_SECRET_KEY: <64 hex chars>
     volumes:
       - tapetum-data:/data
     depends_on:

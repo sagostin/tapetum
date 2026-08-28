@@ -5,7 +5,8 @@ server:
   addr: ":8080"             # TAPETUM_ADDR
   public_url: ""            # TAPETUM_PUBLIC_URL — used in notification links
   data_dir: "./data"        # TAPETUM_DATA_DIR — recordings, server.key, exports
-  dev: false                # TAPETUM_DEV — allows cookies over http for local dev
+  dev: false                # TAPETUM_DEV — plain-HTTP mode: drops the Secure cookie flag.
+                            # Required for http:// access (incl. LAN IPs); off when behind HTTPS.
 
 database:
   url: "postgres://tapetum:tapetum@localhost:5432/tapetum?sslmode=disable"  # TAPETUM_DATABASE_URL

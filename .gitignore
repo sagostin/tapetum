@@ -6,6 +6,7 @@
 # Data / secrets
 /data/
 config.yaml
+.env
 !.idea/
 
 # Frontend

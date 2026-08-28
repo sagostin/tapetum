@@ -31,10 +31,12 @@ notifications (Phase 3), AI object detection and ClickHouse analytics
 ## Quick start (Docker Compose — recommended)
 
 The compose stack is the intended single-node deployment: app + Postgres,
-one command.
+one command. All deploy-time settings live in `.env` — you never need to
+edit `docker-compose.yml`.
 
 ```sh
 git clone <repo-url> && cd tapetum
+cp .env.example .env   # edit: TAPETUM_DEV, POSTGRES_PASSWORD, ...
 docker compose up --build -d
 ```
 
@@ -51,21 +53,66 @@ Two named volumes hold all state:
 ffmpeg is already bundled in the app image (used for clip exports,
 snapshots, and the HEVC→H.264 transcode fallback).
 
+## Homelab deployment (LAN IP + port)
+
+The common case: Tapetum runs on a home server and you open
+`http://<server-ip>:8080` from other machines on the LAN.
+
+**One setting is mandatory:** `TAPETUM_DEV=true`. Session cookies carry the
+`Secure` flag unless dev mode is on, and browsers silently drop Secure
+cookies over plain HTTP on any address other than localhost — so without
+this, login will appear to work but immediately log you out. The name is
+misleading; think of it as "plain-HTTP mode". It's the default in
+`.env.example`, so a fresh `.env` is already LAN-ready:
+
+```sh
+# .env
+TAPETUM_DEV=true
+```
+
+With that set, the stock deployment works as-is on the LAN (`APP_PORT` is
+published on all interfaces). Changing `POSTGRES_PASSWORD`, setting
+`TAPETUM_SECRET_KEY`, and sizing retention from the production section below
+still apply; `TAPETUM_PUBLIC_URL` only matters once you go external.
+
+**WebRTC on LAN in Docker:** in the default bridge network the app
+advertises container-internal ICE candidates, so browsers on other LAN
+machines usually can't establish WebRTC and fall back to MJPEG/HLS
+automatically. On a Linux host you can get real WebRTC by running the app
+with `network_mode: host` (then set
+`TAPETUM_DATABASE_URL=postgres://...@localhost:5432/...` in `.env`).
+
+### Optional: external access
+
+In order of preference:
+
+1. **VPN / mesh (Tailscale, WireGuard)** — zero exposure. Access stays
+   plain HTTP over the tunnel, so keep `TAPETUM_DEV=true`. With Tailscale
+   you can also use `tailscale serve` to get a real HTTPS cert on your
+   tailnet name, in which case dev mode can be off.
+2. **Reverse proxy with TLS** (Caddy, nginx, Traefik) on a domain you own —
+   see the reverse proxy section below. Once you're on HTTPS: turn
+   `TAPETUM_DEV` off (Secure cookies work again) and set
+   `TAPETUM_PUBLIC_URL=https://nvr.example.com`.
+3. **Plain port-forward** — works but is not recommended: credentials and
+   video cross the internet unencrypted. If you do it anyway,
+   `TAPETUM_DEV=true` must stay on.
+
 ## Production deployment (single node, self-hosted)
 
-The stock `docker-compose.yml` works out of the box, but before exposing it
-for real use:
+Everything below is a `.env` edit — `docker-compose.yml` stays stock:
 
-1. **Change the database password.** Edit both the `db` service's
-   `POSTGRES_PASSWORD` and the `TAPETUM_DATABASE_URL` on the `app` service.
-2. **Don't publish Postgres.** Remove the `ports:` block from the `db`
-   service — it's only there for local development.
+1. **Change the database password** — set `POSTGRES_PASSWORD` in `.env`. The
+   app's `TAPETUM_DATABASE_URL` is constructed from it automatically.
+2. **Postgres is not exposed.** The compose file publishes it on
+   `127.0.0.1:5432` only (for local tooling) — nothing to do. To remove even
+   that, drop the `ports:` block from the `db` service.
 3. **Set the public URL** if you access Tapetum through a domain or reverse
    proxy — it's used in notification/export links:
 
-   ```yaml
-   environment:
-     TAPETUM_PUBLIC_URL: https://nvr.example.com
+   ```sh
+   # .env
+   TAPETUM_PUBLIC_URL=https://nvr.example.com
    ```
 
 4. **Set a fixed secret key** (optional but recommended). Tapetum encrypts
@@ -74,7 +121,7 @@ for real use:
    as the `tapetum-data` volume survives. To manage it yourself:
 
    ```sh
-   openssl rand -hex 32   # → TAPETUM_SECRET_KEY
+   openssl rand -hex 32   # → TAPETUM_SECRET_KEY in .env
    ```
 
    Keep this key safe: losing it makes stored secrets undecryptable.
@@ -175,7 +222,7 @@ optional if env vars cover everything.
 | `server.addr` | `TAPETUM_ADDR` | `:8080` | HTTP listen address |
 | `server.public_url` | `TAPETUM_PUBLIC_URL` | — | External URL, used in notification links |
 | `server.data_dir` | `TAPETUM_DATA_DIR` | `./data` (`/data` in Docker) | Recordings, transcode cache, `server.key` |
-| `server.dev` | `TAPETUM_DEV` | `false` | Allows cookies over plain http for local dev |
+| `server.dev` | `TAPETUM_DEV` | `false` | "Plain-HTTP mode": drops the Secure cookie flag. **Required** for any non-TLS access (LAN IP included); turn off when serving over HTTPS |
 | `database.url` | `TAPETUM_DATABASE_URL` | `postgres://tapetum:tapetum@localhost:5432/tapetum?sslmode=disable` | Required Postgres |
 | `log.level` | `TAPETUM_LOG_LEVEL` | `info` | `debug` \| `info` \| `warn` \| `error` |
 | — | `TAPETUM_SECRET_KEY` | auto-generated | 64 hex chars; encrypts secrets at rest |
