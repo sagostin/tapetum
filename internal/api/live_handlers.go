@@ -2,6 +2,7 @@ package api
 
 import (
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 
@@ -10,6 +11,23 @@ import (
 	"github.com/sagostin/tapetum/internal/auth"
 	"github.com/sagostin/tapetum/internal/live"
 )
+
+// h264LiveMime returns the Content-Type for an H.264 live fMP4 stream,
+// embedding the codec string the SourceBuffer will need (parsed from the
+// SPS NALU). The browser reads this off the response and passes it to
+// MediaSource.addSourceBuffer — without an exact match, MSE rejects the
+// init segment and the stream falls back to HLS/MJPEG.
+func h264LiveMime(sps []byte) string {
+	if len(sps) < 4 {
+		return "video/mp4"
+	}
+	// SPS NALU layout (after the 1-byte NALU header):
+	//   profile_idc (1 byte), constraint_set_flags (1 byte), level_idc (1 byte).
+	// RFC 6381 codec string: avc1.<profile_idc><constraint_flags_hex><level_idc*10>.
+	profile := sps[1]
+	level := sps[3]
+	return fmt.Sprintf(`video/mp4; codecs="avc1.%02X00%02X"`, profile, level)
+}
 
 // liveMP4 streams a camera's main-stream access units as a continuous
 // fragmented MP4 byte stream (UniFi Protect-style). The browser consumes
@@ -52,7 +70,7 @@ func (s *Server) liveMP4(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	w.Header().Set("Content-Type", "video/mp4")
+	w.Header().Set("Content-Type", h264LiveMime(sps))
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 

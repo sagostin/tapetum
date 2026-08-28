@@ -105,36 +105,64 @@ function startFmp4() {
   mseAbort = new AbortController()
   video.src = URL.createObjectURL(mse)
 
-  // MediaSource.readyState transitions to 'open' async; register listeners
-  // before opening the stream so we can pipe init + parts into SourceBuffer.
-  mse.addEventListener('sourceopen', () => onSourceOpen(video))
+  // SourceBuffer.addSourceBuffer requires the codec string up front, but
+  // the camera's actual H.264 profile/level (e.g. High@5.0 = avc1.640032)
+  // varies per stream and only lives inside the init segment. The server
+  // echoes it in the Content-Type header, so we issue the fetch early and
+  // pass the codec into addSourceBuffer once MediaSource opens.
+  const initFetch = fetch(fmp4Url(), { signal: mseAbort.signal })
+
+  mse.addEventListener('sourceopen', () => {
+    void onSourceOpen(video, initFetch)
+  })
   mse.addEventListener('error', () => {
     if (!destroyed) startHlsFallback()
   })
   return true
 }
 
-function onSourceOpen(video: HTMLVideoElement) {
+async function onSourceOpen(video: HTMLVideoElement, initFetch: Promise<Response>) {
   if (!mse || mseSourceBuffer) return
-  mseSourceBuffer = mse.addSourceBuffer('video/mp4; codecs="avc1.640028"')
+
+  // Default to a common H.264 profile; the server's Content-Type overrides
+  // this when present.
+  let mime = 'video/mp4; codecs="avc1.640028"'
+  try {
+    const res = await initFetch
+    if (!res.ok || !res.body) {
+      throw new Error(`HTTP ${res.status}`)
+    }
+    const ct = res.headers.get('Content-Type')
+    if (ct && ct.includes('codecs=')) {
+      mime = ct
+    }
+    // Some browsers lie about supporting certain levels; if the codec
+    // string the server gave us isn't supported, fall back to High@4.0
+    // (most IP cameras emit <= Level 5.1, which Chrome still accepts under
+    // the High@4.0 string in practice).
+    if (!MediaSource.isTypeSupported(mime)) {
+      mime = 'video/mp4; codecs="avc1.640028"'
+    }
+    mseReader = res.body.getReader()
+  } catch (err) {
+    if (destroyed) return
+    if (!(err instanceof DOMException) || err.name !== 'AbortError') {
+      startHlsFallback()
+    }
+    return
+  }
+
+  if (destroyed || !mse) return
+
+  try {
+    mseSourceBuffer = mse.addSourceBuffer(mime)
+  } catch {
+    if (!destroyed) startHlsFallback()
+    return
+  }
   mseSourceBuffer.mode = 'segments' // appendBuffer is queued automatically
 
-  fetch(fmp4Url(), { signal: mseAbort?.signal })
-    .then((res) => {
-      if (!res.ok || !res.body) {
-        throw new Error(`HTTP ${res.status}`)
-      }
-      mseReader = res.body.getReader()
-      pumpFmp4Chunks(video)
-    })
-    .catch((err) => {
-      if (destroyed) return
-      // SourceBuffer.appendBuffer errors throw QuotaExceededError when the
-      // buffer is full; everything else falls back to HLS.
-      if (!(err instanceof DOMException) || err.name !== 'AbortError') {
-        startHlsFallback()
-      }
-    })
+  pumpFmp4Chunks(video)
 }
 
 function pumpFmp4Chunks(video: HTMLVideoElement) {
