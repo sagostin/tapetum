@@ -134,6 +134,12 @@ func (s *Server) timeline(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	evs, err := s.evStore.InRange(r.Context(), camID, from, to, 1000)
+	if err != nil {
+		Error(w, http.StatusInternalServerError, "internal", err.Error())
+		return
+	}
+
 	JSON(w, http.StatusOK, map[string]any{
 		"camera_id": camID,
 		"from":      from,
@@ -141,7 +147,7 @@ func (s *Server) timeline(w http.ResponseWriter, r *http.Request) {
 		"buckets":   buckets,
 		"density":   density,
 		"recorded":  mergeRanges(segs),
-		"events":    []any{}, // phase 3
+		"events":    evs,
 	})
 }
 
@@ -183,26 +189,43 @@ func (s *Server) availability(w http.ResponseWriter, r *http.Request) {
 // buildPlaylist renders a media playlist for segments (docs/05). With
 // transcode=true the init + segment URLs point at lazily transcoded H.264
 // variants (H.265 cameras, unsupported browsers).
-func buildPlaylist(camID string, segs []*record.Segment, live bool, transcode bool) string {
+//
+// windowStart/windowEnd clamp the first/last fragment durations to the
+// requested range so hls.js doesn't see an inflated EXTINF on the leading
+// or trailing fragment (which can confuse buffer/end-of-stream logic).
+func buildPlaylist(camID string, segs []*record.Segment, live bool, transcode bool, windowStart, windowEnd time.Time) string {
 	var b []byte
 	p := func(format string, args ...any) {
 		b = append(b, fmt.Sprintf(format, args...)...)
 	}
 	p("#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-TARGETDURATION:10\n#EXT-X-MEDIA-SEQUENCE:0\n")
+	if !live {
+		p("#EXT-X-PLAYLIST-TYPE:VOD\n")
+	}
 	if transcode {
 		p("#EXT-X-MAP:URI=\"/api/v1/playback/%s/init.mp4?transcode=1\"\n", camID)
 	} else {
 		p("#EXT-X-MAP:URI=\"/api/v1/playback/%s/init.mp4\"\n", camID)
 	}
 	if live {
-		p("#EXT-X-PLAYLIST-TYPE:EVENT\n")
+		// Keep historical event semantics for live; not used after the rewrite below.
 	}
-	for _, s := range segs {
-		dur := s.End.Sub(s.Start).Seconds()
-		if dur <= 0 {
-			dur = 6
+	for i, s := range segs {
+		start := s.Start
+		end := s.End
+		// Clamp first/last to the requested window so EXTINF reflects what
+		// we'll actually deliver to the player.
+		if i == 0 && start.Before(windowStart) {
+			start = windowStart
 		}
-		p("#EXT-X-PROGRAM-DATE-TIME:%s\n", s.Start.UTC().Format("2006-01-02T15:04:05.000Z"))
+		if i == len(segs)-1 && end.After(windowEnd) {
+			end = windowEnd
+		}
+		dur := end.Sub(start).Seconds()
+		if dur <= 0 {
+			dur = 0.001
+		}
+		p("#EXT-X-PROGRAM-DATE-TIME:%s\n", start.UTC().Format("2006-01-02T15:04:05.000Z"))
 		p("#EXTINF:%.3f,\n", dur)
 		if transcode {
 			p("/api/v1/segments/%s?transcode=h264\n", s.ID)
@@ -245,7 +268,7 @@ func (s *Server) playbackPlaylist(w http.ResponseWriter, r *http.Request) {
 		Error(w, http.StatusNotFound, "no_recordings", "no recordings in range")
 		return
 	}
-	servePlaylist(w, buildPlaylist(cam.ID, segs, false, wantsTranscode(r)))
+	servePlaylist(w, buildPlaylist(cam.ID, segs, false, wantsTranscode(r), start, end))
 }
 
 func (s *Server) livePlaylist(w http.ResponseWriter, r *http.Request) {
@@ -264,7 +287,9 @@ func (s *Server) livePlaylist(w http.ResponseWriter, r *http.Request) {
 		Error(w, http.StatusNotFound, "no_recordings", "no recent segments")
 		return
 	}
-	servePlaylist(w, buildPlaylist(camID, segs, true, wantsTranscode(r)))
+	now := time.Now()
+	windowStart := segs[0].Start
+	servePlaylist(w, buildPlaylist(camID, segs, true, wantsTranscode(r), windowStart, now))
 }
 
 func servePlaylist(w http.ResponseWriter, pl string) {

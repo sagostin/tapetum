@@ -61,6 +61,11 @@ func (s *Store) Set(ctx context.Context, key string, v any) error {
 	return err
 }
 
+// Encrypt/Decrypt expose the at-rest secret encryption for other stores
+// that keep secrets in JSON columns (notification channel configs).
+func (s *Store) Encrypt(plain string) (string, error) { return s.encrypt(plain) }
+func (s *Store) Decrypt(enc string) (string, error)   { return s.decrypt(enc) }
+
 func (s *Store) encrypt(plain string) (string, error) {
 	if plain == "" {
 		return "", nil

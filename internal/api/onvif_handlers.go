@@ -124,7 +124,7 @@ func (s *Server) onvifSync(w http.ResponseWriter, r *http.Request) {
 	audit.Log(r.Context(), s.pool, audit.Entry{
 		UserID: u.ID, Action: "camera.onvif_sync", Target: cam.ID, IP: clientIP(r),
 	})
-	s.ingest.Sync(r.Context(), cam.ID)
+	s.syncCamera(r.Context(), cam.ID, false)
 	JSON(w, http.StatusOK, map[string]any{"camera": updated, "probe": res})
 }
 

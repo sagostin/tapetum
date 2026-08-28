@@ -128,6 +128,36 @@ enabled.
 - [ ] Security pass: SSRF guards, header audit, dependency audit, rate-limit
       review
 - [ ] Docs: install guide, reverse-proxy guide, S3 guide, FAQ
+- [ ] Playback UI overhaul (UI3-style) — see notes below
+
+### Playback UI overhaul (in-flight)
+
+`/playback` and `/playback/:cameraId` are converging on a single UI3-style
+shape: one camera-at-a-time player area at the top with full digital
+zoom/pan, plus a zoomable/pan-able combined timeline at the bottom that
+shows recordings from every camera at once (color-coded per camera).
+
+- [x] Shared `VideoPlayer.vue` — bare `<video>` in a CSS-transform
+      container, custom control bar, no native browser controls.
+- [x] Digital zoom/pan composable (`useZoomPan`) reused everywhere.
+- [x] Shared `ZoomableTimeline.vue` — wheel-zoom + drag-pan + click-seek
+      + double-click-to-open + pip-click-to-event.
+- [x] Aggregate view (`/playback`) with camera tabs, mode toggle
+      (overlay / stacked), and click-to-drill.
+- [x] Single-camera view (`/playback/:cameraId`) uses the same player +
+      timeline primitives.
+- [ ] Camera groups in the aggregate view (Phase 5 work; rows/timeline
+      should fold into a single chip and timeline row when group scope
+      is selected).
+- [ ] Density-heatmap buckets backend (Phase 3 territory but rendered in
+      the new timeline today via Postgres; ClickHouse accelerates at
+      Phase 4).
+- [ ] Hover thumbnail popup on the timeline (UI3 seek hint).
+- [ ] Pinch-to-zoom on touch devices.
+- [ ] Export-range drag-select on the timeline (drag a span → POST /exports).
+- [ ] Keyboard map (UI3 parity: `space` play/pause, `←`/`→` ±10 s in
+      playback or cycle cams in live, `F` fullscreen, `0` reset zoom,
+      `+/-` zoom).
 
 **Exit:** 1.0.
 

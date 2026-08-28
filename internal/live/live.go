@@ -98,14 +98,15 @@ func (h *Hub) Offer(camID string, sub bool, au [][]byte, pts int64) {
 }
 
 // Subscribe attaches a consumer to a stream. The current ring (from the
-// latest keyframe) is replayed into the channel before live frames.
+// latest keyframe) is replayed into the channel before live frames; the
+// codec parameter sets are returned for decoder/bootstrap use.
 // ok=false means the stream has no active session.
-func (h *Hub) Subscribe(camID string, sub bool) (codec string, ch <-chan Frame, cancel func(), ok bool) {
+func (h *Hub) Subscribe(camID string, sub bool) (codec string, sps, pps, vps []byte, ch <-chan Frame, cancel func(), ok bool) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	st, exists := h.streams[streamKey{camID, sub}]
 	if !exists || len(st.ring) == 0 {
-		return "", nil, func() {}, false
+		return "", nil, nil, nil, nil, func() {}, false
 	}
 	c := make(chan Frame, subBuf)
 	for _, f := range st.ring {
@@ -117,7 +118,7 @@ func (h *Hub) Subscribe(camID string, sub bool) (codec string, ch <-chan Frame, 
 		defer h.mu.Unlock()
 		delete(st.subs, c)
 	}
-	return st.codec, c, cancel, true
+	return st.codec, st.sps, st.pps, st.vps, c, cancel, true
 }
 
 // Codec returns the active codec ("h264"/"h265") for a stream, "" if none.

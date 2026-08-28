@@ -24,6 +24,9 @@ const (
 	// targetSegDur / maxSegWait: cut at first IDR once the segment is at
 	// least targetSegDur old; never cut mid-GOP (docs/05).
 	targetSegDur = 6 * time.Second
+	// preRollRing is how much footage record_mode=motion keeps before an
+	// event starts (docs/05: 10s ring buffer).
+	preRollRing = 10 * time.Second
 )
 
 // Recorder consumes access units of one camera's main stream and writes
@@ -50,6 +53,12 @@ type Recorder struct {
 	startNTP  time.Time
 	lastNTP   time.Time
 	seq       uint32
+
+	// record_mode state ("off" drops everything; "motion" keeps a pre-roll
+	// ring until MotionActive flips on)
+	mode         string // "continuous" (default), "motion", "off"
+	motionActive bool
+	vNTP         []time.Time // parallel to vSamples; motion-mode ring only
 }
 
 func NewRecorder(camID string, store *Store, backend storage.Backend) *Recorder {
@@ -58,6 +67,42 @@ func NewRecorder(camID string, store *Store, backend storage.Backend) *Recorder 
 		store:   store,
 		backend: backend,
 		log:     slog.With("component", "recorder", "camera", camID),
+	}
+}
+
+// SetMode selects the record mode: "continuous" (default), "motion"
+// (pre-roll ring, persists only during motion windows), "off" (no recording).
+func (r *Recorder) SetMode(mode string) {
+	r.mu.Lock()
+	r.mode = mode
+	r.mu.Unlock()
+	r.log.Debug("record mode set", "mode", mode)
+}
+
+// MotionActive opens/closes the persistence window in motion mode. On
+// activation the pre-roll ring is flushed as the start of the new segment;
+// on deactivation the current segment is closed.
+func (r *Recorder) MotionActive(active bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.mode != "motion" || active == r.motionActive {
+		return
+	}
+	r.motionActive = active
+	if !active {
+		if r.open {
+			if err := r.closeLocked(time.Now()); err != nil {
+				r.log.Warn("motion segment close failed", "err", err)
+			}
+		}
+		return
+	}
+	// activation: adopt the ring as the open segment
+	if !r.open && len(r.vSamples) > 0 {
+		r.open = true
+		r.vFirstPTS = r.vPTS[0]
+		r.startNTP = r.vNTP[0]
+		r.lastNTP = r.vNTP[len(r.vNTP)-1]
 	}
 }
 
@@ -91,6 +136,26 @@ func (r *Recorder) WriteVideo(au [][]byte, pts int64, ntp time.Time) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
+	if r.mode == "off" {
+		return nil
+	}
+
+	if r.mode == "motion" && !r.motionActive {
+		// ring buffer: keep the last preRollRing of decodable GOPs, never persist
+		avcc, err := h264.AVCC(au).Marshal()
+		if err != nil {
+			return err
+		}
+		r.vSamples = append(r.vSamples, &fmp4.Sample{
+			IsNonSyncSample: !randAcc,
+			Payload:         avcc,
+		})
+		r.vPTS = append(r.vPTS, pts)
+		r.vNTP = append(r.vNTP, ntp)
+		r.trimRingLocked()
+		return nil
+	}
+
 	if !r.open {
 		if !randAcc {
 			return nil // wait for an IDR to open a segment
@@ -119,6 +184,31 @@ func (r *Recorder) WriteVideo(au [][]byte, pts int64, ntp time.Time) error {
 	r.vPTS = append(r.vPTS, pts)
 	r.lastNTP = ntp
 	return nil
+}
+
+// trimRingLocked bounds the motion-mode ring to preRollRing, cutting only
+// at GOP boundaries (drops everything before the newest keyframe at or
+// older than the cutoff) so the ring always starts decodable.
+func (r *Recorder) trimRingLocked() {
+	latest := r.vNTP[len(r.vNTP)-1]
+	if latest.Sub(r.vNTP[0]) <= preRollRing {
+		return
+	}
+	cutoff := latest.Add(-preRollRing)
+	cut := 0
+	for i, t := range r.vNTP {
+		if t.After(cutoff) {
+			break
+		}
+		if !r.vSamples[i].IsNonSyncSample { // keyframe — safe new head
+			cut = i
+		}
+	}
+	if cut > 0 {
+		r.vSamples = r.vSamples[cut:]
+		r.vPTS = r.vPTS[cut:]
+		r.vNTP = r.vNTP[cut:]
+	}
 }
 
 // WriteAudio appends an AAC access unit (raw frame, no ADTS). pts is in
@@ -157,7 +247,7 @@ func (r *Recorder) Close() {
 func (r *Recorder) closeLocked(nextSegStart time.Time) error {
 	r.open = false
 	defer func() {
-		r.vSamples, r.vPTS = nil, nil
+		r.vSamples, r.vPTS, r.vNTP = nil, nil, nil
 		r.aSamples, r.aPTS = nil, nil
 	}()
 

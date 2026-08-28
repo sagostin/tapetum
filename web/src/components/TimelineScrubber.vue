@@ -7,11 +7,19 @@ interface Range {
   endMs: number
 }
 
+export interface TimelinePip {
+  id: string
+  ms: number
+  type: string
+  label?: string
+}
+
 const props = defineProps<{
   fromMs: number
   toMs: number
   recorded: Range[]
   density: number[]
+  events?: TimelinePip[]
   playheadMs: number | null
 }>()
 
@@ -39,6 +47,17 @@ const segments = computed(() =>
 )
 
 const playheadPct = computed(() => (props.playheadMs == null ? null : pct(props.playheadMs)))
+
+const pips = computed(() =>
+  (props.events ?? [])
+    .map((e) => ({ ...e, left: pct(e.ms) }))
+    .filter((e) => e.left >= 0 && e.left <= 100),
+)
+
+function pipTitle(p: TimelinePip): string {
+  const what = p.type === 'ai' && p.label ? p.label : p.type
+  return `${what} — ${formatTime(p.ms)}`
+}
 
 const densityBars = computed(() => {
   if (!props.density.length) return []
@@ -126,6 +145,17 @@ function onPointerUp() {
           :style="{ left: s.left + '%', width: s.width + '%' }"
         ></div>
       </div>
+      <button
+        v-for="p in pips"
+        :key="p.id"
+        type="button"
+        class="pip"
+        :class="{ 'pip-ai': p.type === 'ai' }"
+        :style="{ left: p.left + '%' }"
+        :title="pipTitle(p)"
+        @pointerdown.stop
+        @click.stop="emit('seek', p.ms)"
+      ></button>
       <div v-if="playheadPct != null" class="playhead" :style="{ left: playheadPct + '%' }"></div>
     </div>
     <div class="ruler">
@@ -193,6 +223,24 @@ function onPointerUp() {
   background: #fff;
   box-shadow: 0 0 6px rgba(255, 255, 255, 0.6);
   pointer-events: none;
+}
+
+.pip {
+  position: absolute;
+  top: 2px;
+  width: 8px;
+  height: 8px;
+  margin-left: -4px;
+  padding: 0;
+  border: none;
+  border-radius: 50%;
+  background: #f59e0b;
+  cursor: pointer;
+  z-index: 2;
+}
+
+.pip-ai {
+  background: #ef4444;
 }
 
 .ruler {

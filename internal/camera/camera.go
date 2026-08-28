@@ -47,6 +47,9 @@ type Camera struct {
 	GroupID           *string        `json:"group_id"`
 	PlaybackTranscode string         `json:"playback_transcode"`
 	ImagingConfig     map[string]any `json:"imaging_config"`
+	DisplayRotate     int            `json:"display_rotate"`
+	DisplayHFlip      bool           `json:"display_hflip"`
+	DisplayVFlip      bool           `json:"display_vflip"`
 	Status            Status         `json:"status"`
 	StatusDetail      map[string]any `json:"status_detail"`
 	LastSeenAt        *time.Time     `json:"last_seen_at"`
@@ -107,8 +110,9 @@ func (s *Store) DecryptPassword(enc []byte) (string, error) {
 const columns = `id, name, enabled, main_url, sub_url, username, password_enc,
 	transport, onvif_endpoint, onvif_profile, has_ptz, record_mode,
 	retention_days, retention_gb, tier_after_days, motion_config, ai_config,
-	group_id, playback_transcode, imaging_config, status, status_detail,
-	last_seen_at, created_at, updated_at`
+	group_id, playback_transcode, imaging_config,
+	display_rotate, display_hflip, display_vflip,
+	status, status_detail, last_seen_at, created_at, updated_at`
 
 func (s *Store) scan(row pgx.Row) (*Camera, error) {
 	var c Camera
@@ -116,8 +120,9 @@ func (s *Store) scan(row pgx.Row) (*Camera, error) {
 		&c.Username, &c.PasswordEnc, &c.Transport, &c.OnvifEndpoint,
 		&c.OnvifProfile, &c.HasPTZ, &c.RecordMode, &c.RetentionDays,
 		&c.RetentionGB, &c.TierAfterDays, &c.MotionConfig, &c.AIConfig,
-		&c.GroupID, &c.PlaybackTranscode, &c.ImagingConfig, &c.Status,
-		&c.StatusDetail, &c.LastSeenAt, &c.CreatedAt, &c.UpdatedAt)
+		&c.GroupID, &c.PlaybackTranscode, &c.ImagingConfig,
+		&c.DisplayRotate, &c.DisplayHFlip, &c.DisplayVFlip,
+		&c.Status, &c.StatusDetail, &c.LastSeenAt, &c.CreatedAt, &c.UpdatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -204,6 +209,8 @@ type CreateParams struct {
 	TierAfterDays     *int
 	PlaybackTranscode string
 	GroupID           *string
+	MotionConfig      map[string]any
+	AIConfig          map[string]any
 }
 
 func (s *Store) Create(ctx context.Context, p CreateParams) (*Camera, error) {
@@ -215,16 +222,26 @@ func (s *Store) Create(ctx context.Context, p CreateParams) (*Camera, error) {
 	if transcode == "" {
 		transcode = "auto"
 	}
+	motionCfg := p.MotionConfig
+	if motionCfg == nil {
+		motionCfg = map[string]any{}
+	}
+	aiCfg := p.AIConfig
+	if aiCfg == nil {
+		aiCfg = map[string]any{}
+	}
 	return s.scan(s.pool.QueryRow(ctx, `
 		INSERT INTO cameras (name, main_url, sub_url, username, password_enc,
 		                     transport, onvif_endpoint, onvif_profile, has_ptz,
 		                     record_mode, retention_days, retention_gb,
-		                     tier_after_days, playback_transcode, group_id)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+		                     tier_after_days, playback_transcode, group_id,
+		                     motion_config, ai_config)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
 		RETURNING `+columns,
 		p.Name, p.MainURL, p.SubURL, p.Username, enc, p.Transport,
 		p.OnvifEndpoint, p.OnvifProfile, p.HasPTZ, p.RecordMode,
-		p.RetentionDays, p.RetentionGB, p.TierAfterDays, transcode, p.GroupID))
+		p.RetentionDays, p.RetentionGB, p.TierAfterDays, transcode, p.GroupID,
+		motionCfg, aiCfg))
 }
 
 // UpdateParams carries optional field updates; nil pointer = leave unchanged.
@@ -247,6 +264,9 @@ type UpdateParams struct {
 	MotionConfig      map[string]any
 	AIConfig          map[string]any
 	ImagingConfig     map[string]any
+	DisplayRotate     *int
+	DisplayHFlip      *bool
+	DisplayVFlip      *bool
 }
 
 func (s *Store) Update(ctx context.Context, id string, p UpdateParams) (*Camera, error) {
@@ -322,19 +342,29 @@ func (s *Store) Update(ctx context.Context, id string, p UpdateParams) (*Camera,
 	if p.ImagingConfig != nil {
 		cur.ImagingConfig = p.ImagingConfig
 	}
+	if p.DisplayRotate != nil {
+		cur.DisplayRotate = *p.DisplayRotate
+	}
+	if p.DisplayHFlip != nil {
+		cur.DisplayHFlip = *p.DisplayHFlip
+	}
+	if p.DisplayVFlip != nil {
+		cur.DisplayVFlip = *p.DisplayVFlip
+	}
 	return s.scan(s.pool.QueryRow(ctx, `
 		UPDATE cameras SET name=$2, main_url=$3, sub_url=$4, username=$5,
 			password_enc=$6, transport=$7, record_mode=$8, retention_days=$9,
 			retention_gb=$10, group_id=$11, motion_config=$12, ai_config=$13,
 			onvif_endpoint=$14, onvif_profile=$15, has_ptz=$16,
 			tier_after_days=$17, playback_transcode=$18, imaging_config=$19,
+			display_rotate=$20, display_hflip=$21, display_vflip=$22,
 			updated_at=now()
 		WHERE id=$1 RETURNING `+columns,
 		id, cur.Name, cur.MainURL, cur.SubURL, cur.Username, cur.PasswordEnc,
 		cur.Transport, cur.RecordMode, cur.RetentionDays, cur.RetentionGB,
 		cur.GroupID, cur.MotionConfig, cur.AIConfig, cur.OnvifEndpoint,
 		cur.OnvifProfile, cur.HasPTZ, cur.TierAfterDays, cur.PlaybackTranscode,
-		cur.ImagingConfig))
+		cur.ImagingConfig, cur.DisplayRotate, cur.DisplayHFlip, cur.DisplayVFlip))
 }
 
 func (s *Store) Delete(ctx context.Context, id string) error {

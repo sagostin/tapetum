@@ -8,9 +8,10 @@
 | Build | Vite |
 | State | Pinia |
 | Router | Vue Router (auth guards, role-based route gating) |
-| Playback | hls.js (+ native HLS on Safari) |
+| Playback | hls.js (+ native HLS on Safari), bare `<video>` (no native controls) |
 | Live | native `RTCPeerConnection` (WebRTC), `<img>` MJPEG fallback |
-| Timeline | custom `<canvas>` component (no chart lib) |
+| Timeline | shared `ZoomableTimeline.vue` (DOM-based, no chart lib) |
+| Player zoom/pan | CSS `transform: translate() scale()` composable (`useZoomPan`) |
 | HTTP | fetch wrapper w/ CSRF header injection + 401→login redirect |
 | Realtime | native WebSocket client with auto-reconnect |
 | Styling | CSS custom properties; dark-first (it's a monitoring app) |
@@ -27,11 +28,12 @@ web/
 │   ├── router/              # routes + guards
 │   ├── stores/              # auth, cameras, events, system (Pinia)
 │   ├── api/                 # typed client per domain (auth.ts, cameras.ts, …)
+│   ├── composables/         # reusable Vue composables (useZoomPan, …)
 │   ├── components/
 │   │   ├── CameraTile.vue       # grid cell: WebRTC/MJPEG + status overlay
-│   │   ├── LivePlayer.vue       # WebRTC primary, fallback chain
-│   │   ├── HlsPlayer.vue        # playback wrapper around hls.js
-│   │   ├── TimelineScrubber.vue # canvas: density + events + coverage + playhead
+│   │   ├── LivePlayer.vue       # WebRTC primary, MJPEG fallback
+│   │   ├── VideoPlayer.vue      # UI3-style player: bare video + CSS-zoom + custom controls
+│   │   ├── ZoomableTimeline.vue # wheel-zoom, drag-pan, click-seek, event pips
 │   │   ├── PtzPad.vue           # directional pad + zoom slider + presets
 │   │   ├── ZoneEditor.vue       # draw motion zones on a snapshot
 │   │   └── EventCard.vue        # snapshot, label chips, clip link, ack
@@ -40,7 +42,8 @@ web/
 │   │   ├── LoginView.vue
 │   │   ├── DashboardView.vue    # live grid
 │   │   ├── CameraView.vue       # single cam: live + PTZ + imaging + stats
-│   │   ├── PlaybackView.vue     # HLS + timeline + export
+│   │   ├── PlaybackView.vue     # single cam: VideoPlayer + ZoomableTimeline
+│   │   ├── PlaybackAggregateView.vue  # UI3-style: tabs + single player + combined timeline
 │   │   ├── EventsView.vue       # filterable feed
 │   │   └── admin/
 │   │       ├── UsersView.vue    # users, roles, per-camera ACL matrix
@@ -59,7 +62,8 @@ web/
 | `/login` | LoginView | none |
 | `/` | DashboardView | live |
 | `/cameras/:id` | CameraView | live (+ ACL) |
-| `/cameras/:id/playback` | PlaybackView | playback (+ ACL) |
+| `/playback` | PlaybackAggregateView | playback |
+| `/playback/:cameraId` | PlaybackView | playback (+ ACL) |
 | `/events` | EventsView | events |
 | `/admin/*` | admin views | respective `:write` perms |
 
@@ -75,36 +79,88 @@ client-side (UX only — server enforces for real).
   shows status badge (● online / ▲ degraded / ○ offline), name, clock.
 - Click → CameraView. Live event toasts via WS.
 
-### Playback (the money view)
+### Playback — Aggregate view (`/playback`)
+
+The primary playback surface. UI3-style: a single video pane at the top
+showing whichever camera the user is focused on, with an aggregate
+combined timeline at the bottom that shows recordings from **all**
+cameras at once.
 
 ```
-┌──────────────────────────────────────────────┐
-│                 video (hls.js)               │
-├──────────────────────────────────────────────┤
-│ timeline (canvas, full width)                │
-│ ▓▓▓░░▓▓ gap ▓▓▓▓░░░▓▓   ← density heatmap    │
-│ ▲person ▲motion        ← event markers       │
-│        │playhead (draggable)                 │
-│ [◀ day] 2026-08-27 [day ▶]  [⤓ export clip]  │
-└──────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────┐
+│  [grandpa1] [motion-cam] [cam-3]   ← camera tabs        │
+├──────────────────────────────────────────────────────────┤
+│                                                          │
+│                  video (one camera)                      │
+│                                                          │
+├──────────────────────────────────────────────────────────┤
+│ 8/27 14:00 → 8/27 17:00  [Reset]   [Overlay][Stacked]    │
+│ ▓▓▓▓░░▓▓▓░░▓▓▓▓▓▓▓  ← combined timeline (color per cam) │
+│  ▲person  ▲motion                  ← event pips         │
+│        │ playhead                                        │
+└──────────────────────────────────────────────────────────┘
 ```
 
-**TimelineScrubber.vue mechanics:**
+- Camera tabs above the player: click to load that camera. ←/→ to cycle.
+- Aggregate timeline below: color-coded segments per camera. Click a
+  segment to load that camera at that time into the player; click a pip
+  to jump straight to that event; double-click to open the dedicated
+  single-camera page.
+- Scroll-wheel on the timeline zooms around the cursor (15 min ↔ 7 day);
+  drag side-to-side pans.
+- In playback mode the VideoPlayer's own control bar is shown
+  (play/pause, ±10 s, scrubber, time, zoom buttons, fullscreen, reset).
 
-1. On range change: one `GET /recordings/timeline?buckets=<pixelWidth>`.
-2. Canvas draws: coverage mask (grey gaps), density as green intensity,
-   events as colored pips (red = person etc.).
-3. Drag playhead → compute ts → `GET /playback/{id}/playlist.m3u8?start=ts`
-   → hand to hls.js → first frame in <300ms on LAN (segment = one 6s chunk).
-4. Hover → thumbnail popup (`thumbs/<segmentId>.jpg`).
-5. Drag-select a range → `POST /exports` → toast + download when WS says done.
-6. Zoom: buckets re-fetched at finer granularity (day → hour → 10min).
+### Playback — Single-camera view (`/playback/:cameraId`)
+
+Same VideoPlayer + ZoomableTimeline components, focused on one camera.
+Used when drilling down via "Open {camera} →" or double-clicking the
+aggregate timeline.
+
+### `VideoPlayer.vue`
+
+UI3-style player wrapper. A bare `<video>` (no native controls) sits
+inside a CSS-transform container so we can digital-zoom and pan around
+the footage independently of the underlying stream.
+
+- **Zoom**: scroll-wheel anywhere on the video zooms around the cursor
+  (trackpad pinch = `ctrlKey+wheel`). `+` / `−` keys, zoom buttons in the
+  control bar. Cursor switches to `grab` when zoomed, `grabbing` while
+  panning.
+- **Pan**: drag with the pointer to pan when zoomed in (CSS transform;
+  bounded so you can't fly off the frame).
+- **Control bar** (visible in playback mode): play/pause, ±10 s, scrubber
+  with click/drag seek, current time / duration, zoom group
+  (`−` / `Fit` / `+` / `⤢`), fullscreen.
+- **No native controls**: deliberately hides the browser's `<video controls>`
+  so dynamic src reloads and our own input handlers don't fight the
+  browser UI. The user only ever sees our overlay + bar.
+- **Source modes**: `mode: 'live'` (no control bar, optional LIVE badge)
+  or `mode: 'playback'` (control bar shown, control bar's autoplay and
+  seek-bias are off — user must press play).
+
+### `ZoomableTimeline.vue`
+
+Shared horizontal scrubber for all timelines.
+
+- **Click**: emit `seek(timeMs)` (and `select(timeMs, camId?)` for the
+  aggregate row's camera-finding logic).
+- **Drag**: pan the window — emits `window-change(fromMs, toMs)` as the
+  user drags so the parent can refetch timelines at the new range.
+- **Wheel**: zoom around the cursor (15 min ↔ 7 day).
+- **Double-click**: emit `open(timeMs, camId?)` — the parent uses this to
+  navigate to the dedicated single-camera page.
+- **Pip click**: emit `select(timeMs, camId)` — drills straight into that
+  event.
+- `aggregate` mode renders one combined row with per-segment hue; `stacked`
+  mode (in the aggregate view) renders one row per camera with the
+  default color.
 
 ### Events feed
 
 - Filters: camera multi-select, type, AI label chips, date range, unacked.
 - Card: snapshot with drawn bbox, camera, time, label+confidence, buttons:
-  play clip (inline HLS), download, ack.
+  play clip (inline VideoPlayer), download, ack.
 - Live prepend on WS `event.created`.
 
 ### Admin — Users
@@ -144,5 +200,7 @@ Reconnect: exponential backoff, resync state via REST on reconnect.
 - Initial load: <150KB JS gz (route-level code splitting; hls.js lazy-loaded
   on playback routes only).
 - Dashboard with 12 tiles: sub-streams only; main stream never in grid.
-- Timeline interactions: <16ms draw per frame (canvas, precomputed buckets).
+- Timeline interactions: <16ms draw per frame (the new ZoomableTimeline
+  is DOM-based, no canvas; revisit if perf becomes a concern).
 - No virtual scrolling needed until events > 1k/page (cursor pagination).
+

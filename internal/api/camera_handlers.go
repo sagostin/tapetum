@@ -112,7 +112,7 @@ func (s *Server) createCamera(w http.ResponseWriter, r *http.Request) {
 		UserID: u.ID, Action: "camera.create", Target: cam.ID, IP: clientIP(r),
 		Detail: map[string]any{"name": cam.Name},
 	})
-	s.ingest.Sync(r.Context(), cam.ID)
+	s.syncCamera(r.Context(), cam.ID, false)
 	JSON(w, http.StatusCreated, cam)
 }
 
@@ -187,7 +187,7 @@ func (s *Server) updateCamera(w http.ResponseWriter, r *http.Request) {
 	audit.Log(r.Context(), s.pool, audit.Entry{
 		UserID: u.ID, Action: "camera.update", Target: cam.ID, IP: clientIP(r),
 	})
-	s.ingest.Sync(r.Context(), cam.ID)
+	s.syncCamera(r.Context(), cam.ID, false)
 	JSON(w, http.StatusOK, updated)
 }
 
@@ -196,7 +196,7 @@ func (s *Server) deleteCamera(w http.ResponseWriter, r *http.Request) {
 	if cam == nil {
 		return
 	}
-	s.ingest.Remove(cam.ID)
+	s.syncCamera(r.Context(), cam.ID, true)
 	s.transcode.EvictCamera(cam.ID)
 
 	if r.URL.Query().Get("delete_recordings") == "true" {
@@ -240,7 +240,7 @@ func (s *Server) setCameraEnabled(enabled bool) http.HandlerFunc {
 		audit.Log(r.Context(), s.pool, audit.Entry{
 			UserID: u.ID, Action: action, Target: cam.ID, IP: clientIP(r),
 		})
-		s.ingest.Sync(r.Context(), cam.ID)
+		s.syncCamera(r.Context(), cam.ID, false)
 		JSON(w, http.StatusOK, map[string]any{"enabled": enabled})
 	}
 }
@@ -333,4 +333,58 @@ func (s *Server) cameraStats(w http.ResponseWriter, r *http.Request) {
 		stats["recorded_bytes"] = n
 	}
 	JSON(w, http.StatusOK, stats)
+}
+
+// validDisplayRotate reports whether v is one of the allowed rotation values
+// (degrees). Used by PATCH /cameras/{id}/display.
+func validDisplayRotate(v int) bool {
+	switch v {
+	case 0, 90, 180, 270:
+		return true
+	}
+	return false
+}
+
+// updateCameraDisplay persists the UI3 wall-tile display orientation for a
+// single camera (rotate / h-flip / v-flip). Used by the dashboard wall and
+// the camera detail view to remember per-tile transforms across reloads and
+// browsers.
+func (s *Server) updateCameraDisplay(w http.ResponseWriter, r *http.Request) {
+	cam := s.cameraFor(w, r)
+	if cam == nil {
+		return
+	}
+	var b struct {
+		Rotate *int  `json:"rotate"`
+		HFlip  *bool `json:"hflip"`
+		VFlip  *bool `json:"vflip"`
+	}
+	if err := Decode(w, r, &b); err != nil {
+		Error(w, http.StatusBadRequest, "bad_request", "invalid JSON body")
+		return
+	}
+	if b.Rotate != nil && !validDisplayRotate(*b.Rotate) {
+		Error(w, http.StatusBadRequest, "bad_request",
+			"rotate must be 0|90|180|270")
+		return
+	}
+	if b.Rotate == nil && b.HFlip == nil && b.VFlip == nil {
+		Error(w, http.StatusBadRequest, "bad_request",
+			"at least one of rotate, hflip, vflip is required")
+		return
+	}
+	updated, err := s.cams.Update(r.Context(), cam.ID, camera.UpdateParams{
+		DisplayRotate: b.Rotate,
+		DisplayHFlip:  b.HFlip,
+		DisplayVFlip:  b.VFlip,
+	})
+	if err != nil {
+		Error(w, http.StatusInternalServerError, "internal", err.Error())
+		return
+	}
+	u := auth.UserFrom(r.Context())
+	audit.Log(r.Context(), s.pool, audit.Entry{
+		UserID: u.ID, Action: "camera.display", Target: cam.ID, IP: clientIP(r),
+	})
+	JSON(w, http.StatusOK, updated)
 }

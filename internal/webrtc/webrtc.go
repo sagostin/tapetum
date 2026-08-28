@@ -67,7 +67,7 @@ func (s *Server) HandleOffer(ctx context.Context, camID, stream, offerSDP string
 	}
 	sub := stream != "main"
 
-	codec, ch, cancel, ok := s.hub.Subscribe(camID, sub)
+	codec, _, _, _, ch, cancel, ok := s.hub.Subscribe(camID, sub)
 	if !ok {
 		return "", ErrStreamUnavailable
 	}

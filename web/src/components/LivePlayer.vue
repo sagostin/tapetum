@@ -1,17 +1,35 @@
 <script setup lang="ts">
-import { onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { post } from '../api/client'
 import { startWebRTC } from '../lib/webrtc'
+import type { DisplayRotate } from '../api/types'
+
+type Fit = 'contain' | 'cover'
 
 const props = withDefaults(
   defineProps<{
     cameraId: string
     stream?: 'sub' | 'main'
     muted?: boolean
+    /** When true, the "Live" badge and MJPEG-fallback tag are hidden. */
+    hideBadge?: boolean
+    /** object-fit mode — 'contain' = UI3 Fit, 'cover' = UI3 Fill. */
+    fit?: Fit
+    /** Rotation in degrees — only multiples of 90 are honored. */
+    rotate?: DisplayRotate
+    /** Mirror the video horizontally. */
+    hflip?: boolean
+    /** Mirror the video vertically. */
+    vflip?: boolean
   }>(),
   {
     stream: 'sub',
     muted: true,
+    hideBadge: false,
+    fit: 'contain',
+    rotate: 0,
+    hflip: false,
+    vflip: false,
   },
 )
 
@@ -62,27 +80,54 @@ watch(
   },
 )
 
+// Compute the CSS transform that orients the media element. Rotate first,
+// then flip on the rotated frame (so a 90° + hflip mirrors vertically,
+// matching UI3's expectations).
+const mediaTransform = computed(() => {
+  const r = props.rotate || 0
+  const sx = props.hflip ? -1 : 1
+  const sy = props.vflip ? -1 : 1
+  if (r === 0) {
+    return sx === 1 && sy === 1 ? 'none' : `scale(${sx}, ${sy})`
+  }
+  return `rotate(${r}deg) scale(${sx}, ${sy})`
+})
+
+// Rotate 90 / 270 swap the tile aspect ratio; the wrapper applies this.
+const isRotated = computed(() => props.rotate === 90 || props.rotate === 270)
+
 onBeforeUnmount(stop)
 
 defineExpose({ mode })
 </script>
 
 <template>
-  <div class="live-player">
-    <video
-      v-show="mode === 'webrtc'"
-      ref="videoEl"
-      class="live-media"
-      autoplay
-      playsinline
-      :muted="muted"
-    ></video>
-    <img v-if="mode === 'mjpeg'" :src="mjpegUrl()" class="live-media" alt="live stream" />
-    <span class="live-badge" :class="{ 'live-badge-mjpeg': mode === 'mjpeg' }">
+  <div class="live-player" :class="{ 'live-rotated': isRotated }">
+    <div class="live-frame">
+      <video
+        v-show="mode === 'webrtc'"
+        ref="videoEl"
+        class="live-media"
+        :class="`live-fit-${fit}`"
+        :style="{ transform: mediaTransform }"
+        autoplay
+        playsinline
+        :muted="muted"
+      ></video>
+      <img
+        v-if="mode === 'mjpeg'"
+        :src="mjpegUrl()"
+        class="live-media"
+        :class="`live-fit-${fit}`"
+        :style="{ transform: mediaTransform }"
+        alt="live stream"
+      />
+    </div>
+    <span v-if="!hideBadge" class="live-badge" :class="{ 'live-badge-mjpeg': mode === 'mjpeg' }">
       <span class="live-dot" aria-hidden="true"></span>
       Live
     </span>
-    <span v-if="mode === 'mjpeg'" class="live-note">MJPEG fallback</span>
+    <span v-if="!hideBadge && mode === 'mjpeg'" class="live-note">MJPEG fallback</span>
   </div>
 </template>
 
@@ -95,11 +140,40 @@ defineExpose({ mode })
   overflow: hidden;
 }
 
+/* live-frame hosts the media so the rotation transform sits on a 100%
+   sized box while the player still flexes to whatever the parent wants. */
+.live-frame {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
 .live-media {
   display: block;
   width: 100%;
   height: 100%;
+  transition: transform 0.18s ease;
+  transform-origin: center center;
+}
+
+.live-fit-contain {
+  object-fit: contain;
+  max-width: 100%;
+  max-height: 100%;
+}
+
+.live-fit-cover {
   object-fit: cover;
+}
+
+/* When the media is rotated 90/270, the source is square-tile-shaped in its
+   own coordinate system but rotated to portrait. Constrain its visible
+   bounds so it stays centered and clips symmetrically. */
+.live-player.live-rotated .live-media {
+  width: 100%;
+  height: 100%;
 }
 
 .live-badge {
@@ -117,6 +191,7 @@ defineExpose({ mode })
   background: rgba(0, 0, 0, 0.55);
   padding: 0.15rem 0.45rem;
   border-radius: 4px;
+  pointer-events: none;
 }
 
 .live-dot {
@@ -139,5 +214,6 @@ defineExpose({ mode })
   background: rgba(0, 0, 0, 0.55);
   padding: 0.15rem 0.45rem;
   border-radius: 4px;
+  pointer-events: none;
 }
 </style>

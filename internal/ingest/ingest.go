@@ -109,6 +109,17 @@ func (s *Supervisor) Close() {
 	s.workers = map[string]*cameraWorker{}
 }
 
+// MotionSignal flips the motion-recording window for a camera
+// (record_mode=motion). Called from the event-bus bridge in main.
+func (s *Supervisor) MotionSignal(camID string, active bool) {
+	s.mu.Lock()
+	w, ok := s.workers[camID]
+	s.mu.Unlock()
+	if ok {
+		w.recorder.MotionActive(active)
+	}
+}
+
 // Stats returns live health stats for a camera.
 func (s *Supervisor) Stats(camID string) map[string]any {
 	s.mu.Lock()

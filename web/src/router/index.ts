@@ -6,9 +6,12 @@ import DashboardView from '../views/DashboardView.vue'
 
 const CamerasView = () => import('../views/CamerasView.vue')
 const CameraDetailView = () => import('../views/CameraDetailView.vue')
+const PlaybackAggregateView = () => import('../views/PlaybackAggregateView.vue')
 const PlaybackView = () => import('../views/PlaybackView.vue')
+const EventsView = () => import('../views/EventsView.vue')
 const ProfileView = () => import('../views/ProfileView.vue')
 const StorageView = () => import('../views/StorageView.vue')
+const NotificationsView = () => import('../views/NotificationsView.vue')
 const SystemView = () => import('../views/SystemView.vue')
 
 const router = createRouter({
@@ -44,7 +47,9 @@ const router = createRouter({
     },
     {
       path: '/playback',
-      redirect: '/',
+      name: 'playback-aggregate',
+      component: PlaybackAggregateView,
+      meta: { requiresAuth: true, requiresPerm: 'playback' },
     },
     {
       path: '/playback/:cameraId',
@@ -59,9 +64,21 @@ const router = createRouter({
       meta: { requiresAuth: true },
     },
     {
+      path: '/events',
+      name: 'events',
+      component: EventsView,
+      meta: { requiresAuth: true, requiresPerm: 'events' },
+    },
+    {
       path: '/admin/storage',
       name: 'admin-storage',
       component: StorageView,
+      meta: { requiresAuth: true, requiresPerm: 'settings:write' },
+    },
+    {
+      path: '/admin/notifications',
+      name: 'admin-notifications',
+      component: NotificationsView,
       meta: { requiresAuth: true, requiresPerm: 'settings:write' },
     },
     {

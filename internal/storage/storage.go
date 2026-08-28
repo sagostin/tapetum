@@ -45,3 +45,8 @@ func SegmentKey(cameraID string, start time.Time) string {
 func ExportKey(exportID string) string {
 	return fmt.Sprintf("exports/%s.mp4", exportID)
 }
+
+// SnapshotKey builds the key for an event snapshot JPEG.
+func SnapshotKey(eventID string) string {
+	return fmt.Sprintf("snapshots/%s.jpg", eventID)
+}

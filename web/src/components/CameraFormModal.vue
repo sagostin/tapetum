@@ -4,6 +4,7 @@ import { post, patch, ApiError } from '../api/client'
 import type {
   Camera,
   CameraPayload,
+  MotionZone,
   OnvifProbeResponse,
   PlaybackTranscode,
   ProbeResponse,
@@ -11,6 +12,7 @@ import type {
   RecordMode,
   Transport,
 } from '../api/types'
+import ZoneEditor from './ZoneEditor.vue'
 
 export interface CameraPrefill {
   name?: string
@@ -42,6 +44,21 @@ const form = reactive({
   onvif_endpoint: props.camera?.onvif_endpoint ?? props.prefill?.onvif_endpoint ?? '',
   tier_after_days: props.camera?.tier_after_days ?? null as number | null,
   playback_transcode: (props.camera?.playback_transcode ?? 'auto') as PlaybackTranscode,
+})
+
+// Motion detection (cameras.motion_config).
+const mc = props.camera?.motion_config ?? {}
+const everydayWindow = mc.schedule?.everyday?.[0]
+const motion = reactive({
+  enabled: mc.enabled ?? false,
+  sensitivity: mc.sensitivity ?? 0.6,
+  min_area_pct: mc.min_area_pct ?? 0.5,
+  pre_roll_s: mc.pre_roll_s ?? 5,
+  post_roll_s: mc.post_roll_s ?? 10,
+  cooldown_s: mc.cooldown_s ?? 30,
+  sched_from: everydayWindow?.[0] ?? '',
+  sched_to: everydayWindow?.[1] ?? '',
+  zones: (mc.zones ?? []) as MotionZone[],
 })
 
 const saving = ref(false)
@@ -123,6 +140,20 @@ async function save() {
   if (form.onvif_endpoint) payload.onvif_endpoint = form.onvif_endpoint
   if (form.tier_after_days != null) payload.tier_after_days = form.tier_after_days
   if (form.playback_transcode !== 'auto') payload.playback_transcode = form.playback_transcode
+  const schedule: Record<string, [string, string][]> = {}
+  if (motion.sched_from && motion.sched_to) {
+    schedule.everyday = [[motion.sched_from, motion.sched_to]]
+  }
+  payload.motion_config = {
+    enabled: motion.enabled,
+    sensitivity: motion.sensitivity,
+    min_area_pct: motion.min_area_pct,
+    zones: motion.zones,
+    schedule,
+    pre_roll_s: motion.pre_roll_s,
+    post_roll_s: motion.post_roll_s,
+    cooldown_s: motion.cooldown_s,
+  }
   try {
     if (props.camera) {
       await patch(`/cameras/${props.camera.id}`, payload)
@@ -219,6 +250,62 @@ async function save() {
             </select>
           </label>
         </div>
+
+        <fieldset class="motion-section">
+          <legend>
+            <label class="motion-toggle">
+              <input v-model="motion.enabled" type="checkbox" />
+              Motion detection
+            </label>
+          </legend>
+
+          <template v-if="motion.enabled">
+            <div class="field-row">
+              <label class="field">
+                <span>Sensitivity <em>{{ Math.round(motion.sensitivity * 100) }}%</em></span>
+                <input v-model.number="motion.sensitivity" type="range" min="0.05" max="1" step="0.05" />
+              </label>
+              <label class="field">
+                <span>Min area (%)</span>
+                <input v-model.number="motion.min_area_pct" type="number" min="0.1" max="100" step="0.1" />
+              </label>
+            </div>
+
+            <div class="field-row">
+              <label class="field">
+                <span>Pre-roll (s)</span>
+                <input v-model.number="motion.pre_roll_s" type="number" min="0" max="10" />
+              </label>
+              <label class="field">
+                <span>Post-roll (s)</span>
+                <input v-model.number="motion.post_roll_s" type="number" min="1" />
+              </label>
+            </div>
+
+            <div class="field-row">
+              <label class="field">
+                <span>Cooldown (s)</span>
+                <input v-model.number="motion.cooldown_s" type="number" min="0" />
+              </label>
+              <div class="field-row">
+                <label class="field">
+                  <span>Active from <em>optional</em></span>
+                  <input v-model="motion.sched_from" type="time" />
+                </label>
+                <label class="field">
+                  <span>until</span>
+                  <input v-model="motion.sched_to" type="time" />
+                </label>
+              </div>
+            </div>
+
+            <div v-if="isEdit && camera" class="zones-wrap">
+              <span class="zones-label">Zones <em>drawn on the live snapshot</em></span>
+              <ZoneEditor :camera-id="camera.id" :zones="motion.zones" @update:zones="motion.zones = $event" />
+            </div>
+            <p v-else class="muted zones-hint">Save the camera first to draw zones on its snapshot.</p>
+          </template>
+        </fieldset>
 
         <div class="probe-row">
           <button
@@ -321,6 +408,57 @@ async function save() {
   gap: 0.75rem;
   margin-bottom: 1.1rem;
   min-height: 2.4rem;
+}
+
+.motion-section {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 0.9rem;
+  margin-bottom: 1.1rem;
+}
+
+.motion-section legend {
+  padding: 0 0.4rem;
+}
+
+.motion-toggle {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  font-size: 0.9rem;
+  font-weight: 500;
+  cursor: pointer;
+}
+
+.motion-section input[type='range'] {
+  width: 100%;
+}
+
+.motion-section input[type='time'] {
+  width: 100%;
+  padding: 0.6rem 0.75rem;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text);
+  font-size: 0.95rem;
+  font-family: inherit;
+}
+
+.zones-wrap {
+  margin-top: 0.4rem;
+}
+
+.zones-label {
+  display: block;
+  font-size: 0.82rem;
+  color: var(--text-muted);
+  margin-bottom: 0.45rem;
+}
+
+.zones-hint {
+  font-size: 0.85rem;
+  margin: 0.4rem 0 0;
 }
 
 .probe-ok {

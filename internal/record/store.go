@@ -243,6 +243,15 @@ func (s *Store) ProtectRange(ctx context.Context, camID string, start, end time.
 	return ct.RowsAffected(), err
 }
 
+// MarkMotionRange sets has_motion on segments overlapping [start, end].
+func (s *Store) MarkMotionRange(ctx context.Context, camID string, start, end time.Time) error {
+	_, err := s.pool.Exec(ctx, `
+		UPDATE recording_segments SET has_motion=true
+		WHERE camera_id=$1 AND start_ts < $3 AND end_ts > $2`,
+		camID, start, end)
+	return err
+}
+
 func (s *Store) Unprotect(ctx context.Context, id string) error {
 	ct, err := s.pool.Exec(ctx,
 		`UPDATE recording_segments SET protected=false WHERE id=$1`, id)

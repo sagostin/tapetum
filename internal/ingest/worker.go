@@ -64,6 +64,8 @@ func newCameraWorker(cam *camera.Camera, cams *camera.Store, segs *record.Store,
 	backend storage.Backend, hub *ws.Hub, liveHub *live.Hub, snap *snapshot, log *slog.Logger,
 ) *cameraWorker {
 	ctx, cancel := context.WithCancel(context.Background())
+	rec := record.NewRecorder(cam.ID, segs, backend)
+	rec.SetMode(cam.RecordMode)
 	return &cameraWorker{
 		cam:      cam,
 		cams:     cams,
@@ -75,7 +77,7 @@ func newCameraWorker(cam *camera.Camera, cams *camera.Store, segs *record.Store,
 		log:      log.With("camera", cam.Name, "camera_id", cam.ID),
 		ctx:      ctx,
 		cancel:   cancel,
-		recorder: record.NewRecorder(cam.ID, segs, backend),
+		recorder: rec,
 		detail:   map[string]any{},
 		status:   camera.StatusOffline, // zero value "" would violate the DB check
 	}
