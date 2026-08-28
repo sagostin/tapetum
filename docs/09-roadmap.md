@@ -8,19 +8,19 @@ ordered.
 
 **Goal:** bootable app with auth and an empty dashboard.
 
-- [ ] Go module hygiene: rename module to a real path (e.g.
+- [x] Go module hygiene: rename module to a real path (e.g.
       `github.com/<org>/tapetum`), `cmd/tapetumd` entrypoint
-- [ ] Config loader (YAML + env overrides): server, db, storage, analytics
-- [ ] Postgres wiring: pgx pool, goose migrations, migration 0001 (users,
+- [x] Config loader (YAML + env overrides): server, db, storage, analytics
+- [x] Postgres wiring: pgx pool, goose migrations, migration 0001 (users,
       sessions, tokens, settings)
-- [ ] Auth: argon2id, sessions, CSRF, login/logout/me, rate-limited login
-- [ ] RBAC middleware + role matrix
-- [ ] First-run wizard API (`/setup`) + admin creation
-- [ ] API scaffolding: router, error envelope, audit log writer
-- [ ] Vue 3 scaffold: Vite, Pinia, router + guards, login + setup views,
+- [x] Auth: argon2id, sessions, CSRF, login/logout/me, rate-limited login
+- [x] RBAC middleware + role matrix
+- [x] First-run wizard API (`/setup`) + admin creation
+- [x] API scaffolding: router, error envelope, audit log writer
+- [x] Vue 3 scaffold: Vite, Pinia, router + guards, login + setup views,
       API client with CSRF
-- [ ] WS hub skeleton
-- [ ] Dockerfile + docker-compose (tapetumd + postgres)
+- [x] WS hub skeleton
+- [x] Dockerfile + docker-compose (tapetumd + postgres)
 
 **Exit:** create admin → log in → see empty dashboard. `docker compose up`
 works from clean checkout.
@@ -82,20 +82,29 @@ needs physical hardware (soak, cross-cutting requirement).
 
 **Goal:** the NVR tells you when things happen.
 
-- [ ] Motion engine on sub-stream: frame diff, zones, sensitivity, schedules
-- [ ] Event state machine → `events` rows + snapshots (full-res from main
+- [x] Motion engine on sub-stream: frame diff, zones, sensitivity, schedules
+- [x] Event state machine → `events` rows + snapshots (full-res from main
       stream) + segment protection
-- [ ] ONVIF pull-point client for camera-native motion events (custom SOAP;
+- [x] ONVIF pull-point client for camera-native motion events (custom SOAP;
       onvif-go Event service gap)
-- [ ] `record_mode: motion` (pre-roll ring buffer)
-- [ ] Events API + feed UI + event detail (snapshot, clip player, ack)
-- [ ] Timeline density (Postgres buckets) + event markers on scrubber
-- [ ] Notify worker: smtp, webhook, ntfy, gotify, discord, slack, telegram;
+- [x] `record_mode: motion` (pre-roll ring buffer)
+- [x] Events API + feed UI + event detail (snapshot, clip player, ack)
+- [x] Timeline density (Postgres buckets) + event markers on scrubber
+- [x] Notify worker: smtp, webhook, ntfy, gotify, discord, slack, telegram;
       rules engine (schedule + cooldown); test-send; delivery log UI
-- [ ] WS `event.created` toasts
+- [x] WS `event.created` toasts
 
 **Exit:** walk in front of a camera → motion event with snapshot → phone
 notification within seconds → tap through to the clip.
+
+**Implemented (code-complete, E2E smoke pending):** motion engine w/
+zones/sensitivity/schedules + state machine → events + full-res snapshots +
+segment protection; ONVIF pull-point; record_mode=motion pre-roll ring;
+events feed w/ live `event.created` prepend + inline clip player + ack;
+timeline density buckets + event markers; notify worker w/ all 7 senders +
+rules + test-send + delivery log UI; global toasts (AppShell). Still owed:
+E2E smoke paragraph (like Phases 1–2) + real-hardware soak (cross-cutting
+requirement).
 
 ## Phase 4 — AI Detection & Analytics
 
